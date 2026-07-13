@@ -207,9 +207,9 @@ Current repository state:
   - `decode(...)` through the same dispatcher
   - `load(fp)` when `fp.read()` returns `str`, `bytes`, `bytearray`, or a
     supported bytes-like object
-- Verified HPy CPython ABI test command:
-  - `PYTHONPATH=/private/tmp/ujson-hpy-build/lib .venv/bin/python -m pytest -q tests/test_ujson_hpy.py`
-  - current result: `34 passed, 3 skipped`
+- Decode validation is now covered by the helper flow:
+  - `./scripts/hpy-test.sh cpython tests/test_ujson_hpy.py tests/test_ujson_hpy_upstream_subset.py`
+  - `./scripts/hpy-test.sh universal tests/test_ujson_hpy.py tests/test_ujson_hpy_upstream_subset.py`
 
 ### Phase 4: Encoder Port (`dumps`, `dump`)
 
@@ -250,22 +250,18 @@ Acceptance criteria:
 
 Current repository state:
 
-- HPy encoder path is no longer a stub:
-  - `PYTHONPATH=/private/tmp/ujson-hpy-build/lib .venv/bin/python -m pytest -q tests/test_ujson_hpy.py`
-  - current result: `34 passed, 3 skipped`
-- The main upstream suite still passes in the default non-HPy path:
-  - `.venv/bin/python -m pytest -q`
-  - current result: `476 passed, 38 skipped, 1 xfailed`
+- HPy encoder path is fully wired into `dumps`, `encode`, and `dump`.
+- The main local validation set currently passes:
+  - classic suite: `476 passed, 40 skipped, 1 xfailed`
+  - HPy CPython suite: `174 passed, 4 skipped`
+  - HPy Universal suite: `178 passed`
+  - HPy debug suite: `178 passed`
 - Remaining work in this phase is now parity hardening rather than initial
   plumbing.
 - Added a separate upstream-derived HPy parity subset:
   - `tests/test_ujson_hpy_upstream_subset.py`
-  - verified with CPython ABI artifact:
-    - `PYTHONPATH=/private/tmp/ujson-hpy-build/lib .venv/bin/python -m pytest -q tests/test_ujson_hpy.py tests/test_ujson_hpy_upstream_subset.py`
-    - current result: `174 passed, 4 skipped`
-  - verified with universal ABI artifact:
-    - `PYTHONPATH=/private/tmp/ujson-hpy-universal/lib .venv/bin/python -m pytest -q tests/test_ujson_hpy.py tests/test_ujson_hpy_upstream_subset.py`
-    - current result: `178 passed`
+  - validated through `./scripts/hpy-test.sh cpython`
+  - validated through `./scripts/hpy-test.sh universal`
 
 ### Phase 5: HPy Cleanup and Universal ABI Hardening
 
@@ -290,14 +286,14 @@ Current repository state:
   the classic `ujson` extension.
 - Verified universal build command:
   - `UJSON_BUILD_HPY=1 .venv/bin/python setup.py --hpy-abi=universal --hpy-use-static-libs build_ext --build-temp /private/tmp/ujson-hpy-universal/temp --build-lib /private/tmp/ujson-hpy-universal/lib`
-- Verified universal runtime command:
-  - `PYTHONPATH=/private/tmp/ujson-hpy-universal/lib .venv/bin/python -m pytest -q tests/test_ujson_hpy.py`
-  - current result: `37 passed`
 - The custom `--build-lib` path now also receives a sibling `ujson_hpy.py`
   loader next to `ujson_hpy.hpy0.so`, so the universal artifact can be
   imported directly from the output directory.
 - Universal-only leak checks now pass via `hpy.debug.LeakDetector` for decode,
   encode, and dump flows.
+- The isolated import path is also validated through:
+  - `./scripts/hpy-smoke.sh cpython`
+  - `./scripts/hpy-smoke.sh universal`
 - The decode path now accepts C-contiguous buffer exporters without relying on
   direct `Python.h` buffer APIs, rejects non-contiguous `memoryview` objects
   with a `TypeError`, and now preserves surrogate-containing `str` input during
@@ -349,8 +345,11 @@ Acceptance criteria:
 Current repository state:
 
 - The HPy binding is no longer a bootstrap spike; in this workspace it passes:
-  - CPython HPy ABI: `174 passed, 4 skipped`
-  - universal HPy ABI: `178 passed`
+  - classic suite: `476 passed, 40 skipped, 1 xfailed`
+  - HPy CPython suite: `174 passed, 4 skipped`
+  - HPy Universal suite: `178 passed`
+  - HPy debug suite: `178 passed`
+  - external smoke checks for both ABI modes
 - The upstream project still explicitly describes itself as maintenance-only in
   `README.md`, which materially lowers the odds of a large binding rewrite
   being accepted as a single upstream contribution even when technically sound.
@@ -538,6 +537,30 @@ Decision to lock now:
 - Primary path: fork-first, HPy-focused distribution.
 - Secondary path: upstream only the smallest slices that are reviewable and do
   not require upstream to bless the entire experimental module at once.
+
+### Phase 7: Host Runtime and Upstreamable HPy Slices
+
+Goal: upstream the host-runtime optimizations that materially reduce Universal
+ABI overhead without forking the `ujson_hpy` module ABI.
+
+Tasks:
+
+- isolate host-runtime improvements from `ujson_hpy`-local changes
+- keep semantic regression tests with every host API refinement
+- carry version-specific backports only as documented patches
+
+Current repository state:
+
+- A validated host experiment now improves `HPy_GetItem_i` for exact native
+  lists and tuples before falling back to the generic sequence/mapping path.
+- The backport for HPy 0.9.0 is tracked in:
+  - `patches/hpy-0.9.0-getitem-i-fastpath.patch`
+- The upstream-facing refinement for HPy `master` is tracked in:
+  - `patches/hpy-main-getitem-i-exact-fastpath.patch`
+- The rationale, reproduction commands, and benchmark impact are documented in:
+  - `docs/hpy-getitem-i-fastpath.md`
+- On the measured Universal `dumps(list(range(1024)))` case, the exact-path
+  host change closes the gap to classic `ujson` to roughly 3% on this machine.
 
 ## Suggested File-Level Refactor Plan
 

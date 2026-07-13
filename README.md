@@ -8,38 +8,65 @@
 [![DOI](https://zenodo.org/badge/1418941.svg)](https://zenodo.org/badge/latestdoi/1418941)
 [![Code style: Black](https://img.shields.io/badge/code%20style-Black-000000.svg)](https://github.com/psf/black)
 
-`hpy-ujson` is an HPy-oriented fork of UltraJSON: an ultra fast JSON encoder
-and decoder written in pure C with bindings for Python and HPy hosts.
+`hpy-ujson` is an HPy-focused fork of UltraJSON. It keeps UltraJSON's C
+encoder/decoder core, ports the Python binding layer to HPy, and produces a
+usable `ujson_hpy` module for CPython ABI and Universal ABI hosts.
 
-Install with pip:
-
-```sh
-python -m pip install ujson
-```
+This repository is aimed at local builds, runtime integration, and performance
+work. It is not yet published as a separate PyPI distribution.
 
 ## Project status
 
-> [!WARNING]
-> UltraJSON's architecture is fundamentally ill-suited to making changes without
-> risk of introducing new security vulnerabilities. As a result, this library
-> has been put into a *maintenance-only* mode. Support for new Python versions
-> will be added and critical bugs and security issues will still be
-> fixed but all other changes will be rejected. Users are encouraged to migrate
-> to [orjson](https://pypi.org/project/orjson/) which is both much faster and
-> less likely to introduce a surprise buffer overflow vulnerability in the
-> future.
+- The classic `ujson` extension is still buildable for side-by-side comparison.
+- The HPy port lives in a separate module named `ujson_hpy`.
+- Local validation currently includes:
+  - classic suite: `476 passed, 40 skipped, 1 xfailed`
+  - HPy CPython suite: `174 passed, 4 skipped`
+  - HPy Universal suite: `178 passed`
+  - HPy debug suite: `178 passed`
+  - external smoke checks for CPython and Universal artifacts: passing
+- The repository follows a fork-first model for HPy work. Upstream UltraJSON is
+  still a useful code base reference, but this fork is where HPy-specific
+  iteration, documentation, and host-integration work happen.
+
+## Quick start
+
+Create a local environment and install the development dependencies:
+
+```sh
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip setuptools setuptools-scm pytest hpy tox
+```
+
+Build and validate the HPy artifacts:
+
+```sh
+./scripts/hpy-build.sh cpython
+./scripts/hpy-build.sh universal
+
+./scripts/hpy-test.sh cpython
+./scripts/hpy-test.sh universal
+
+./scripts/hpy-smoke.sh cpython
+./scripts/hpy-smoke.sh universal
+```
 
 ## Usage
 
-May be used as a drop in replacement for most other JSON parsers for Python:
+The classic upstream-style module is still `ujson` when you build the CPython
+extension. The HPy port is imported as `ujson_hpy`:
 
 ```pycon
->>> import ujson
->>> ujson.dumps([{"key": "value"}, 81, True])
+>>> import ujson_hpy
+>>> ujson_hpy.dumps([{"key": "value"}, 81, True])
 '[{"key":"value"},81,true]'
->>> ujson.loads("""[{"key": "value"}, 81, true]""")
+>>> ujson_hpy.loads("""[{"key": "value"}, 81, true]""")
 [{'key': 'value'}, 81, True]
 ```
+
+If you also want the classic extension in the same build, set
+`UJSON_BUILD_CPYTHON_EXT=1`.
 
 ### Encoder options
 
@@ -49,7 +76,7 @@ Used to enable special encoding of "unsafe" HTML characters into safer Unicode
 sequences. Default is `False`:
 
 ```pycon
->>> ujson.dumps("<script>John&Doe", encode_html_chars=True)
+>>> ujson_hpy.dumps("<script>John&Doe", encode_html_chars=True)
 '"\\u003cscript\\u003eJohn\\u0026Doe"'
 ```
 
@@ -60,9 +87,9 @@ If your end format supports UTF-8, setting this option to false is highly recomm
 save space:
 
 ```pycon
->>> ujson.dumps("åäö")
+>>> ujson_hpy.dumps("åäö")
 '"\\u00e5\\u00e4\\u00f6"'
->>> ujson.dumps("åäö", ensure_ascii=False)
+>>> ujson_hpy.dumps("åäö", ensure_ascii=False)
 '"åäö"'
 ```
 
@@ -71,9 +98,9 @@ save space:
 Controls whether forward slashes (`/`) are escaped. Default is `True`:
 
 ```pycon
->>> ujson.dumps("https://example.com")
+>>> ujson_hpy.dumps("https://example.com")
 '"https:\\/\\/example.com"'
->>> ujson.dumps("https://example.com", escape_forward_slashes=False)
+>>> ujson_hpy.dumps("https://example.com", escape_forward_slashes=False)
 '"https://example.com"'
 ```
 
@@ -82,9 +109,9 @@ Controls whether forward slashes (`/`) are escaped. Default is `True`:
 Controls whether indentation ("pretty output") is enabled. Default is `0` (disabled):
 
 ```pycon
->>> ujson.dumps({"foo": "bar"})
+>>> ujson_hpy.dumps({"foo": "bar"})
 '{"foo":"bar"}'
->>> print(ujson.dumps({"foo": "bar"}, indent=4))
+>>> print(ujson_hpy.dumps({"foo": "bar"}, indent=4))
 {
     "foo": "bar"
 }
@@ -151,12 +178,12 @@ in another. In such usage, all bugs are features.
 For those with particular needs, such as Linux distribution packagers, several
 build options are provided in the form of environment variables.
 
-## Experimental HPy build
+## HPy build
 
-This repository also carries an experimental `ujson_hpy` module which ports the
-UltraJSON binding layer to [HPy](https://hpyproject.org/). It is currently kept
-separate from the default `ujson` extension so the upstream package behavior
-stays unchanged.
+This repository carries a usable `ujson_hpy` module which ports the UltraJSON
+binding layer to [HPy](https://hpyproject.org/). It is intentionally kept
+separate from the default `ujson` extension so the classic package behavior
+stays unchanged while the HPy surface evolves.
 
 The HPy flow is opt-in:
 
@@ -165,7 +192,7 @@ UJSON_BUILD_HPY=1 python setup.py --hpy-abi=cpython --hpy-use-static-libs build_
 ```
 
 When `UJSON_BUILD_HPY=1` is set, the build now defaults to producing only the
-experimental `ujson_hpy` extension. Set `UJSON_BUILD_CPYTHON_EXT=1` if you also
+`ujson_hpy` extension. Set `UJSON_BUILD_CPYTHON_EXT=1` if you also
 want to build the classic `ujson` extension in the same invocation.
 
 For reproducible local builds, use the helper scripts in [`scripts/`](./scripts):
@@ -192,12 +219,18 @@ Current `ujson_hpy` status:
 - Universal ABI builds include a sibling loader stub next to
   `ujson_hpy.hpy0.so`, so the output directory is directly importable without
   `pkg_resources`.
+- The full local validation set currently covers the classic suite, HPy
+  CPython/Universal suites, HPy debug mode, and isolated smoke imports.
 
-This HPy module is still experimental and is not published as a drop-in
-replacement package.
+The module is suitable for host integration and performance work, but it is not
+yet published as a drop-in replacement package.
 
 For the exported API, universal build artifacts, and non-CPython host
 integration guidance, see [`docs/ujson-hpy-api.md`](./docs/ujson-hpy-api.md).
+For the current benchmark matrix and optimization roadmap, see
+[`docs/hpy-performance-plan.md`](./docs/hpy-performance-plan.md).
+For the measured HPy host `GetItem_i` optimization slice and upstreamable
+patches, see [`docs/hpy-getitem-i-fastpath.md`](./docs/hpy-getitem-i-fastpath.md).
 
 ### External artifact validation
 
@@ -257,21 +290,31 @@ The helper below benchmarks the built artifact against `json` and, when
 available in the local environment, classic `ujson`:
 
 ```sh
-./scripts/hpy-benchmark.sh universal --loops 20000 --repeat 5
+./scripts/hpy-benchmark-matrix.sh universal --repeat 9 --min-time 0.10
 ```
 
 Local run on July 13, 2026, on `macOS-26.5.2-arm64-arm-64bit-Mach-O` with
-`CPython 3.14.2` and the universal ABI:
+`CPython 3.14.2` and the universal ABI. Results are median operations per
+second from deterministically shuffled library order:
 
 | benchmark | json | ujson_hpy | ujson |
 | --- | --- | --- | --- |
-| dumps compact | 483,933 ops/s | 191,812 ops/s | 1,182,686 ops/s |
-| loads compact | 777,200 ops/s | 654,594 ops/s | 1,330,842 ops/s |
-| dumps sort_keys | 396,260 ops/s | 176,955 ops/s | 828,223 ops/s |
+| loads small object | 1,454,134 ops/s | 2,596,240 ops/s | 2,935,266 ops/s |
+| loads medium object | 782,517 ops/s | 1,132,439 ops/s | 1,315,380 ops/s |
+| loads comprehensive fixture | 44,463 ops/s | 96,165 ops/s | 111,130 ops/s |
+| loads 1024-int array | 31,030 ops/s | 64,748 ops/s | 72,254 ops/s |
+| dumps small object | 797,634 ops/s | 1,768,421 ops/s | 3,067,591 ops/s |
+| dumps medium object | 452,018 ops/s | 686,742 ops/s | 1,136,511 ops/s |
+| dumps comprehensive fixture | 61,185 ops/s | 64,080 ops/s | 95,135 ops/s |
+| dumps 1024-int array | 54,728 ops/s | 43,868 ops/s | 64,818 ops/s |
 
 These figures are machine-specific, but they provide a reproducible baseline
-for this repository and prove that the built universal artifact runs outside the
-default in-tree import path.
+for this repository. The full cpython-vs-universal matrix and the optimization
+roadmap live in [`docs/hpy-performance-plan.md`](./docs/hpy-performance-plan.md).
+The validated HPy host `GetItem_i` fast-path experiment, which brings the
+Universal 1024-int encode case to within about 3% of classic `ujson`, is
+documented in
+[`docs/hpy-getitem-i-fastpath.md`](./docs/hpy-getitem-i-fastpath.md).
 
 ## Contributing
 

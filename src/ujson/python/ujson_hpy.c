@@ -14,24 +14,40 @@ static HPyGlobal g_decimal_type = {0};
 static HPyGlobal g_bytearray_type = {0};
 static HPyGlobal g_memoryview_type = {0};
 
-typedef struct {
+typedef struct HpyJsonValue {
   HPy handle;
+  struct HpyJsonValue *next;
 } HpyJsonValue;
+
+typedef struct HpyJsonValueBlock {
+  struct HpyJsonValueBlock *next;
+  HpyJsonValue items[256];
+} HpyJsonValueBlock;
 
 typedef struct {
   HPyContext *ctx;
+  HpyJsonValue *free_values;
+  HpyJsonValueBlock *value_blocks;
 } HpyDecoderState;
 
 typedef struct {
   HPyContext *ctx;
   HPy default_fn;
+  struct HpyEncoderTypeContext *free_type_contexts;
+  struct HpyEncoderTypeContextBlock *type_context_blocks;
+  union {
+    JSINT64 long_value;
+    JSUINT64 unsigned_long_value;
+    double double_value;
+  } scalar;
 } HpyEncoderState;
 
-typedef struct {
+typedef struct HpyEncoderTypeContext {
   JSPFN_ITEREND iterEnd;
   JSPFN_ITERNEXT iterNext;
   JSPFN_ITERGETNAME iterGetName;
   JSPFN_ITERGETVALUE iterGetValue;
+  struct HpyEncoderTypeContext *next;
   HPy newObj;
   HPy utf8BytesObj;
   HPy dictObj;
@@ -40,12 +56,18 @@ typedef struct {
   JSOBJ itemValue;
   HPy itemName;
   HPy rawJSONValue;
+  bool has_resources;
 
   union {
     JSINT64 longValue;
     JSUINT64 unsignedLongValue;
   };
 } HpyEncoderTypeContext;
+
+typedef struct HpyEncoderTypeContextBlock {
+  struct HpyEncoderTypeContextBlock *next;
+  HpyEncoderTypeContext items[64];
+} HpyEncoderTypeContextBlock;
 
 typedef char assert_wchar_t_is_jsuint32[1 - 2 * !(sizeof(wchar_t) == sizeof(JSUINT32))];
 
@@ -67,6 +89,15 @@ hpy_dump_impl(HPyContext *ctx, HPy self, const HPy *args, size_t nargs,
 static const char *
 hpy_unicode_to_utf8_raw(HPyContext *ctx, HPy obj, size_t *out_len,
                         HPy *bytes_holder);
+
+static inline void
+hpy_close_if_nonnull(HPyContext *ctx, HPy handle)
+{
+  if (!HPy_IsNull(handle))
+  {
+    HPy_Close(ctx, handle);
+  }
+}
 
 static void
 set_decode_error(HPyContext *ctx, const char *message)
@@ -94,16 +125,8 @@ hpy_json_value_new(HPyContext *ctx, HPy handle)
   }
 
   value->handle = handle;
+  value->next = NULL;
   return value;
-}
-
-static HPy
-hpy_json_value_detach(HpyJsonValue *value)
-{
-  HPy handle = value->handle;
-  value->handle = HPy_NULL;
-  free(value);
-  return handle;
 }
 
 static void
@@ -116,6 +139,90 @@ hpy_json_value_release(HPyContext *ctx, HpyJsonValue *value)
 
   HPy_Close(ctx, value->handle);
   free(value);
+}
+
+static int
+hpy_decoder_grow_value_pool(HpyDecoderState *state)
+{
+  HpyJsonValueBlock *block = malloc(sizeof(HpyJsonValueBlock));
+  size_t i;
+
+  if (block == NULL)
+  {
+    HPyErr_NoMemory(state->ctx);
+    return -1;
+  }
+
+  block->next = state->value_blocks;
+  state->value_blocks = block;
+
+  for (i = 0; i < (sizeof(block->items) / sizeof(block->items[0])) - 1; i++)
+  {
+    block->items[i].next = &block->items[i + 1];
+    block->items[i].handle = HPy_NULL;
+  }
+  block->items[i].next = state->free_values;
+  block->items[i].handle = HPy_NULL;
+  state->free_values = &block->items[0];
+  return 0;
+}
+
+static HpyJsonValue *
+hpy_decoder_value_new(HpyDecoderState *state, HPy handle)
+{
+  HpyJsonValue *value;
+
+  if (state->free_values == NULL && hpy_decoder_grow_value_pool(state) < 0)
+  {
+    HPy_Close(state->ctx, handle);
+    return NULL;
+  }
+
+  value = state->free_values;
+  state->free_values = value->next;
+  value->handle = handle;
+  value->next = NULL;
+  return value;
+}
+
+static HPy
+hpy_decoder_value_detach(HpyDecoderState *state, HpyJsonValue *value)
+{
+  HPy handle = value->handle;
+  value->handle = HPy_NULL;
+  value->next = state->free_values;
+  state->free_values = value;
+  return handle;
+}
+
+static void
+hpy_decoder_value_release(HpyDecoderState *state, HpyJsonValue *value)
+{
+  if (value == NULL)
+  {
+    return;
+  }
+
+  HPy_Close(state->ctx, value->handle);
+  value->handle = HPy_NULL;
+  value->next = state->free_values;
+  state->free_values = value;
+}
+
+static void
+hpy_decoder_cleanup_value_pool(HpyDecoderState *state)
+{
+  HpyJsonValueBlock *block = state->value_blocks;
+
+  while (block != NULL)
+  {
+    HpyJsonValueBlock *next = block->next;
+    free(block);
+    block = next;
+  }
+
+  state->value_blocks = NULL;
+  state->free_values = NULL;
 }
 
 static HpyJsonValue *
@@ -133,7 +240,12 @@ hpy_json_handle_from_jsobj(JSOBJ obj)
 static JSOBJ
 hpy_json_value_dup_as_jsobj(HPyContext *ctx, HPy handle)
 {
-  return hpy_json_value_new(ctx, HPy_Dup(ctx, handle));
+  HpyJsonValue *value = hpy_json_value_new(ctx, HPy_Dup(ctx, handle));
+  if (value == NULL)
+  {
+    return NULL;
+  }
+  return value;
 }
 
 static void
@@ -142,18 +254,79 @@ hpy_json_value_release_jsobj(HPyContext *ctx, JSOBJ obj)
   hpy_json_value_release(ctx, hpy_json_value_from_jsobj(obj));
 }
 
+#ifndef HPY_ABI_CPYTHON
+static int
+hpy_json_value_replace_jsobj(HPyContext *ctx, JSOBJ *obj, HPy handle)
+{
+  HpyJsonValue *value;
+
+  if (*obj == NULL)
+  {
+    value = hpy_json_value_new(ctx, handle);
+    if (value == NULL)
+    {
+      return -1;
+    }
+    *obj = value;
+    return 0;
+  }
+
+  value = hpy_json_value_from_jsobj(*obj);
+  HPy_Close(ctx, value->handle);
+  value->handle = handle;
+  return 0;
+}
+#endif
+
+#ifdef HPY_ABI_CPYTHON
+static int
+hpy_json_value_replace_borrowed(HPyContext *ctx, JSOBJ *obj, HPy handle)
+{
+  HpyJsonValue *value;
+
+  if (*obj == NULL)
+  {
+    value = malloc(sizeof(*value));
+    if (value == NULL)
+    {
+      HPyErr_NoMemory(ctx);
+      return -1;
+    }
+    value->next = NULL;
+    *obj = value;
+  }
+
+  value = hpy_json_value_from_jsobj(*obj);
+  value->handle = handle;
+  return 0;
+}
+
+static void
+hpy_json_value_release_borrowed(JSOBJ obj)
+{
+  free(hpy_json_value_from_jsobj(obj));
+}
+#endif
+
 static JSOBJ
 Decoder_newString(void *prv, JSUINT32 *start, JSUINT32 *end)
 {
   HpyDecoderState *state = prv;
-  HPy handle = HPyUnicode_FromWideChar(
+  HPy handle;
+
+#ifdef HPY_ABI_CPYTHON
+  handle = _py2h(PyUnicode_FromKindAndData(
+      PyUnicode_4BYTE_KIND, (const Py_UCS4 *) start, (Py_ssize_t) (end - start)));
+#else
+  handle = HPyUnicode_FromWideChar(
       state->ctx, (const wchar_t *) start, (HPy_ssize_t) (end - start));
+#endif
   if (HPy_IsNull(handle))
   {
     return NULL;
   }
 
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static void
@@ -170,8 +343,8 @@ Decoder_objectAddKey(void *prv, JSOBJ obj, JSOBJ name, JSOBJ value)
     set_decode_error(ctx, "Invalid JSON: object keys must be strings");
   }
 
-  hpy_json_value_release(ctx, hpy_json_value_from_jsobj(name));
-  hpy_json_value_release(ctx, hpy_json_value_from_jsobj(value));
+  hpy_decoder_value_release(state, hpy_json_value_from_jsobj(name));
+  hpy_decoder_value_release(state, hpy_json_value_from_jsobj(value));
 }
 
 static void
@@ -181,29 +354,31 @@ Decoder_arrayAddItem(void *prv, JSOBJ obj, JSOBJ value)
   HPyContext *ctx = state->ctx;
   HPyList_Append(ctx, hpy_json_handle_from_jsobj(obj),
                  hpy_json_handle_from_jsobj(value));
-  hpy_json_value_release(ctx, hpy_json_value_from_jsobj(value));
+  hpy_decoder_value_release(state, hpy_json_value_from_jsobj(value));
 }
 
 static JSOBJ
 Decoder_newTrue(void *prv)
 {
   HpyDecoderState *state = prv;
-  return hpy_json_value_new(state->ctx, HPy_Dup(state->ctx, state->ctx->h_True));
+  return hpy_decoder_value_new(state,
+                               HPy_Dup(state->ctx, state->ctx->h_True));
 }
 
 static JSOBJ
 Decoder_newFalse(void *prv)
 {
   HpyDecoderState *state = prv;
-  return hpy_json_value_new(state->ctx,
-                            HPy_Dup(state->ctx, state->ctx->h_False));
+  return hpy_decoder_value_new(state,
+                               HPy_Dup(state->ctx, state->ctx->h_False));
 }
 
 static JSOBJ
 Decoder_newNull(void *prv)
 {
   HpyDecoderState *state = prv;
-  return hpy_json_value_new(state->ctx, HPy_Dup(state->ctx, state->ctx->h_None));
+  return hpy_decoder_value_new(state,
+                               HPy_Dup(state->ctx, state->ctx->h_None));
 }
 
 static JSOBJ
@@ -215,7 +390,7 @@ Decoder_newNaN(void *prv)
   {
     return NULL;
   }
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static JSOBJ
@@ -227,7 +402,7 @@ Decoder_newPosInf(void *prv)
   {
     return NULL;
   }
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static JSOBJ
@@ -239,7 +414,7 @@ Decoder_newNegInf(void *prv)
   {
     return NULL;
   }
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static JSOBJ
@@ -251,7 +426,7 @@ Decoder_newObject(void *prv)
   {
     return NULL;
   }
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static JSOBJ
@@ -263,7 +438,7 @@ Decoder_newArray(void *prv)
   {
     return NULL;
   }
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static JSOBJ
@@ -275,7 +450,7 @@ Decoder_newInteger(void *prv, JSINT32 value)
   {
     return NULL;
   }
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static JSOBJ
@@ -287,7 +462,7 @@ Decoder_newLong(void *prv, JSINT64 value)
   {
     return NULL;
   }
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static JSOBJ
@@ -300,19 +475,17 @@ Decoder_newUnsignedLong(void *prv, JSUINT64 value)
   {
     return NULL;
   }
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static JSOBJ
 Decoder_newIntegerFromString(void *prv, char *value, size_t length)
 {
   HpyDecoderState *state = prv;
-  HPy arg = HPy_NULL;
-  HPy tuple = HPy_NULL;
   HPy result = HPy_NULL;
   HPy wrapped = HPy_NULL;
-
   char *buf = malloc(length + 1);
+
   if (buf == NULL)
   {
     HPyErr_NoMemory(state->ctx);
@@ -322,29 +495,37 @@ Decoder_newIntegerFromString(void *prv, char *value, size_t length)
   memcpy(buf, value, length);
   buf[length] = '\0';
 
-  arg = HPyUnicode_FromString(state->ctx, buf);
+#ifdef HPY_ABI_CPYTHON
+  result = _py2h(PyLong_FromString(buf, NULL, 10));
   free(buf);
-  if (HPy_IsNull(arg))
-  {
-    return NULL;
-  }
-
-  tuple = HPyTuple_FromArray(state->ctx, &arg, 1);
-  HPy_Close(state->ctx, arg);
-  if (HPy_IsNull(tuple))
-  {
-    return NULL;
-  }
-
-  result = HPy_CallTupleDict(state->ctx, state->ctx->h_LongType, tuple, HPy_NULL);
-  HPy_Close(state->ctx, tuple);
   if (HPy_IsNull(result))
   {
     return NULL;
   }
+#else
+  {
+    HPy arg = HPyUnicode_FromString(state->ctx, buf);
+    free(buf);
+    if (HPy_IsNull(arg))
+    {
+      return NULL;
+    }
+
+    {
+      HPy call_args[] = {arg};
+      result = HPy_Call(state->ctx, state->ctx->h_LongType, call_args, 1,
+                        HPy_NULL);
+    }
+    HPy_Close(state->ctx, arg);
+    if (HPy_IsNull(result))
+    {
+      return NULL;
+    }
+  }
+#endif
 
   wrapped = result;
-  return hpy_json_value_new(state->ctx, wrapped);
+  return hpy_decoder_value_new(state, wrapped);
 }
 
 static JSOBJ
@@ -356,14 +537,14 @@ Decoder_newDouble(void *prv, double value)
   {
     return NULL;
   }
-  return hpy_json_value_new(state->ctx, handle);
+  return hpy_decoder_value_new(state, handle);
 }
 
 static void
 Decoder_releaseObject(void *prv, JSOBJ obj)
 {
   HpyDecoderState *state = prv;
-  hpy_json_value_release(state->ctx, hpy_json_value_from_jsobj(obj));
+  hpy_decoder_value_release(state, hpy_json_value_from_jsobj(obj));
 }
 
 static const char *loads_kwlist[] = {"obj", NULL};
@@ -372,7 +553,7 @@ static const char *load_kwlist[] = {"fp", NULL};
 static HPy
 hpy_loads_decode_raw(HPyContext *ctx, const char *raw, size_t raw_len)
 {
-  HpyDecoderState state = {.ctx = ctx};
+  HpyDecoderState state = {.ctx = ctx, .free_values = NULL, .value_blocks = NULL};
   JSONObjectDecoder decoder = {
     Decoder_newString,
     Decoder_objectAddKey,
@@ -411,8 +592,9 @@ hpy_loads_decode_raw(HPyContext *ctx, const char *raw, size_t raw_len)
   {
     if (ret != NULL)
     {
-      hpy_json_value_release(ctx, ret);
+      hpy_decoder_value_release(&state, ret);
     }
+    hpy_decoder_cleanup_value_pool(&state);
     return HPy_NULL;
   }
 
@@ -421,18 +603,24 @@ hpy_loads_decode_raw(HPyContext *ctx, const char *raw, size_t raw_len)
     set_decode_error(ctx, decoder.errorStr);
     if (ret != NULL)
     {
-      hpy_json_value_release(ctx, ret);
+      hpy_decoder_value_release(&state, ret);
     }
+    hpy_decoder_cleanup_value_pool(&state);
     return HPy_NULL;
   }
 
   if (ret == NULL)
   {
     HPyErr_SetString(ctx, ctx->h_RuntimeError, "JSON decoder returned NULL");
+    hpy_decoder_cleanup_value_pool(&state);
     return HPy_NULL;
   }
 
-  return hpy_json_value_detach(ret);
+  {
+    HPy result = hpy_decoder_value_detach(&state, ret);
+    hpy_decoder_cleanup_value_pool(&state);
+    return result;
+  }
 }
 
 static HPy
@@ -479,10 +667,9 @@ static HPy
 hpy_loads_decode_buffer_like(HPyContext *ctx, HPy arg)
 {
   HPy memoryview_type = HPyGlobal_Load(ctx, g_memoryview_type);
-  HPy args_tuple = HPy_NULL;
   HPy view = HPy_NULL;
   HPy contiguous = HPy_NULL;
-  HPy empty_args = HPy_NULL;
+  HPy tobytes = HPy_NULL;
   HPy bytes_arg = HPy_NULL;
   int is_contiguous;
 
@@ -491,15 +678,10 @@ hpy_loads_decode_buffer_like(HPyContext *ctx, HPy arg)
     return HPy_NULL;
   }
 
-  args_tuple = HPyTuple_Pack(ctx, 1, arg);
-  if (HPy_IsNull(args_tuple))
   {
-    HPy_Close(ctx, memoryview_type);
-    return HPy_NULL;
+    HPy call_args[] = {arg};
+    view = HPy_Call(ctx, memoryview_type, call_args, 1, HPy_NULL);
   }
-
-  view = HPy_CallTupleDict(ctx, memoryview_type, args_tuple, HPy_NULL);
-  HPy_Close(ctx, args_tuple);
   HPy_Close(ctx, memoryview_type);
   if (HPy_IsNull(view))
   {
@@ -530,15 +712,15 @@ hpy_loads_decode_buffer_like(HPyContext *ctx, HPy arg)
     return HPy_NULL;
   }
 
-  empty_args = HPyTuple_FromArray(ctx, NULL, 0);
-  if (HPy_IsNull(empty_args))
+  tobytes = HPy_GetAttr_s(ctx, view, "tobytes");
+  if (HPy_IsNull(tobytes))
   {
     HPy_Close(ctx, view);
     return HPy_NULL;
   }
 
-  bytes_arg = HPy_CallMethodTupleDict_s(ctx, "tobytes", view, empty_args, HPy_NULL);
-  HPy_Close(ctx, empty_args);
+  bytes_arg = HPy_Call(ctx, tobytes, NULL, 0, HPy_NULL);
+  HPy_Close(ctx, tobytes);
   HPy_Close(ctx, view);
   if (HPy_IsNull(bytes_arg))
   {
@@ -551,6 +733,27 @@ hpy_loads_decode_buffer_like(HPyContext *ctx, HPy arg)
     return result;
   }
 }
+
+#ifdef HPY_ABI_CPYTHON
+static HPy
+hpy_loads_decode_buffer_like_cpython(HPyContext *ctx, HPy arg)
+{
+  Py_buffer buffer;
+  int status = PyObject_GetBuffer(_h2py(arg), &buffer, PyBUF_C_CONTIGUOUS);
+  if (status < 0)
+  {
+    HPyErr_Clear(ctx);
+    return HPy_NULL;
+  }
+
+  {
+    HPy result = hpy_loads_decode_raw(ctx, (const char *) buffer.buf,
+                                      (size_t) buffer.len);
+    PyBuffer_Release(&buffer);
+    return result;
+  }
+}
+#endif
 
 static HPy
 hpy_loads_dispatch(HPyContext *ctx, HPy arg)
@@ -565,6 +768,20 @@ hpy_loads_dispatch(HPyContext *ctx, HPy arg)
     return hpy_loads_decode_bytes(ctx, arg);
   }
 
+#ifdef HPY_ABI_CPYTHON
+  {
+    HPy result = hpy_loads_decode_buffer_like_cpython(ctx, arg);
+    if (!HPy_IsNull(result))
+    {
+      return result;
+    }
+    if (HPyErr_Occurred(ctx))
+    {
+      return HPy_NULL;
+    }
+  }
+#endif
+
   {
     HPy bytearray_type = HPyGlobal_Load(ctx, g_bytearray_type);
     int is_bytearray = 0;
@@ -575,15 +792,9 @@ hpy_loads_dispatch(HPyContext *ctx, HPy arg)
       HPy_Close(ctx, bytearray_type);
       if (is_bytearray)
       {
-        HPy tuple = HPyTuple_Pack(ctx, 1, arg);
         HPy bytes_arg;
-        if (HPy_IsNull(tuple))
-        {
-          return HPy_NULL;
-        }
-
-        bytes_arg = HPy_CallTupleDict(ctx, ctx->h_BytesType, tuple, HPy_NULL);
-        HPy_Close(ctx, tuple);
+        HPy call_args[] = {arg};
+        bytes_arg = HPy_Call(ctx, ctx->h_BytesType, call_args, 1, HPy_NULL);
         if (HPy_IsNull(bytes_arg))
         {
           return HPy_NULL;
@@ -627,36 +838,136 @@ hpy_encoder_state(JSONTypeContext *tc)
   return (HpyEncoderState *) tc->encoder_prv;
 }
 
-static HPy
-hpy_encoder_get_obj_handle(JSOBJ obj, JSONTypeContext *tc)
+static int
+hpy_encoder_grow_type_context_pool(HpyEncoderState *state)
 {
-  HpyEncoderTypeContext *etc = hpy_encoder_type_context(tc);
-  if (!HPy_IsNull(etc->newObj))
+  HpyEncoderTypeContextBlock *block = malloc(sizeof(HpyEncoderTypeContextBlock));
+  size_t i;
+
+  if (block == NULL)
   {
-    return etc->newObj;
+    HPyErr_NoMemory(state->ctx);
+    return -1;
   }
-  return hpy_json_handle_from_jsobj(obj);
+
+  block->next = state->type_context_blocks;
+  state->type_context_blocks = block;
+
+  for (i = 0; i < (sizeof(block->items) / sizeof(block->items[0])) - 1; i++)
+  {
+    block->items[i].next = &block->items[i + 1];
+  }
+  block->items[i].next = state->free_type_contexts;
+  state->free_type_contexts = &block->items[0];
+  return 0;
+}
+
+static HpyEncoderTypeContext *
+hpy_encoder_alloc_type_context(HpyEncoderState *state)
+{
+  HpyEncoderTypeContext *etc;
+
+  if (state->free_type_contexts == NULL &&
+      hpy_encoder_grow_type_context_pool(state) < 0)
+  {
+    return NULL;
+  }
+
+  etc = state->free_type_contexts;
+  state->free_type_contexts = etc->next;
+  memset(etc, 0, sizeof(*etc));
+  etc->newObj = HPy_NULL;
+  etc->utf8BytesObj = HPy_NULL;
+  etc->dictObj = HPy_NULL;
+  etc->itemName = HPy_NULL;
+  etc->rawJSONValue = HPy_NULL;
+  etc->next = NULL;
+  return etc;
 }
 
 static void
-hpy_encoder_type_context_cleanup(HPyContext *ctx, HpyEncoderTypeContext *etc)
+hpy_encoder_release_type_context(HpyEncoderState *state,
+                                 HpyEncoderTypeContext *etc)
 {
   if (etc == NULL)
   {
     return;
   }
 
-  if (etc->itemValue != NULL)
+  if (etc->has_resources && etc->itemValue != NULL)
   {
-    hpy_json_value_release_jsobj(ctx, etc->itemValue);
+#ifdef HPY_ABI_CPYTHON
+    hpy_json_value_release_borrowed(etc->itemValue);
+#else
+    hpy_json_value_release_jsobj(state->ctx, etc->itemValue);
+#endif
     etc->itemValue = NULL;
   }
-  HPy_Close(ctx, etc->itemName);
-  HPy_Close(ctx, etc->dictObj);
-  HPy_Close(ctx, etc->utf8BytesObj);
-  HPy_Close(ctx, etc->rawJSONValue);
-  HPy_Close(ctx, etc->newObj);
-  free(etc);
+  if (etc->has_resources)
+  {
+    hpy_close_if_nonnull(state->ctx, etc->itemName);
+    hpy_close_if_nonnull(state->ctx, etc->dictObj);
+    hpy_close_if_nonnull(state->ctx, etc->utf8BytesObj);
+    hpy_close_if_nonnull(state->ctx, etc->rawJSONValue);
+    hpy_close_if_nonnull(state->ctx, etc->newObj);
+  }
+  etc->next = state->free_type_contexts;
+  state->free_type_contexts = etc;
+}
+
+static void
+hpy_encoder_cleanup_type_context_pool(HpyEncoderState *state)
+{
+  HpyEncoderTypeContextBlock *block = state->type_context_blocks;
+
+  while (block != NULL)
+  {
+    HpyEncoderTypeContextBlock *next = block->next;
+    free(block);
+    block = next;
+  }
+
+  state->type_context_blocks = NULL;
+  state->free_type_contexts = NULL;
+}
+
+static HPy
+hpy_encoder_get_obj_handle(JSOBJ obj, JSONTypeContext *tc)
+{
+  HpyEncoderTypeContext *etc = hpy_encoder_type_context(tc);
+  if (etc != NULL && !HPy_IsNull(etc->newObj))
+  {
+    return etc->newObj;
+  }
+  return hpy_json_handle_from_jsobj(obj);
+}
+
+static int
+hpy_maybe_get_attr_s(HPyContext *ctx, HPy obj, const char *name, HPy *out)
+{
+  *out = HPy_GetAttr_s(ctx, obj, name);
+  if (!HPy_IsNull(*out))
+  {
+    return 1;
+  }
+
+  if (!HPyErr_ExceptionMatches(ctx, ctx->h_AttributeError))
+  {
+    return -1;
+  }
+  HPyErr_Clear(ctx);
+  return 0;
+}
+
+static void
+hpy_encoder_type_context_cleanup_for_state(HpyEncoderState *state,
+                                           HpyEncoderTypeContext *etc)
+{
+  if (etc == NULL)
+  {
+    return;
+  }
+  hpy_encoder_release_type_context(state, etc);
 }
 
 static HPy
@@ -693,13 +1004,50 @@ hpy_unicode_encode_surrogatepass(HPyContext *ctx, HPy obj)
   return result;
 }
 
+static HPy
+hpy_unicode_to_utf8_bytes(HPyContext *ctx, HPy obj)
+{
+  HPy result = HPyUnicode_AsUTF8String(ctx, obj);
+  if (!HPy_IsNull(result))
+  {
+    return result;
+  }
+
+  if (!HPyErr_ExceptionMatches(ctx, ctx->h_UnicodeEncodeError))
+  {
+    return HPy_NULL;
+  }
+  HPyErr_Clear(ctx);
+  return hpy_unicode_encode_surrogatepass(ctx, obj);
+}
+
 static const char *
 hpy_unicode_to_utf8_raw(HPyContext *ctx, HPy obj, size_t *out_len, HPy *bytes_holder)
 {
   HPy_ssize_t len = 0;
   const char *raw;
 
-  HPy_Close(ctx, *bytes_holder);
+  hpy_close_if_nonnull(ctx, *bytes_holder);
+  *bytes_holder = HPy_NULL;
+
+  raw = HPyUnicode_AsUTF8AndSize(ctx, obj, &len);
+  if (raw != NULL)
+  {
+    *bytes_holder = HPy_Dup(ctx, obj);
+    if (HPy_IsNull(*bytes_holder))
+    {
+      return NULL;
+    }
+    *out_len = (size_t) len;
+    return raw;
+  }
+
+  if (!HPyErr_ExceptionMatches(ctx, ctx->h_UnicodeEncodeError))
+  {
+    return NULL;
+  }
+  HPyErr_Clear(ctx);
+
   *bytes_holder = hpy_unicode_encode_surrogatepass(ctx, obj);
   if (HPy_IsNull(*bytes_holder))
   {
@@ -745,11 +1093,44 @@ hpy_bytes_to_utf8(JSOBJ obj, JSONTypeContext *tc, void *out_value, size_t *out_l
 static const char *
 hpy_unicode_to_utf8(JSOBJ obj, JSONTypeContext *tc, void *out_value, size_t *out_len)
 {
-  HPyContext *ctx = hpy_encoder_state(tc)->ctx;
+  HpyEncoderState *state = hpy_encoder_state(tc);
+  HPyContext *ctx = state->ctx;
   HpyEncoderTypeContext *etc = hpy_encoder_type_context(tc);
+  HPy value = hpy_encoder_get_obj_handle(obj, tc);
   (void) out_value;
-  return hpy_unicode_to_utf8_raw(ctx, hpy_encoder_get_obj_handle(obj, tc), out_len,
-                                 &etc->utf8BytesObj);
+
+  if (etc == NULL)
+  {
+    HPy_ssize_t len = 0;
+    const char *raw = HPyUnicode_AsUTF8AndSize(ctx, value, &len);
+    if (raw != NULL)
+    {
+      *out_len = (size_t) len;
+      return raw;
+    }
+    if (!HPyErr_ExceptionMatches(ctx, ctx->h_UnicodeEncodeError))
+    {
+      return NULL;
+    }
+    HPyErr_Clear(ctx);
+
+    etc = hpy_encoder_alloc_type_context(state);
+    if (etc == NULL)
+    {
+      return NULL;
+    }
+    tc->prv = etc;
+  }
+
+  {
+    const char *raw = hpy_unicode_to_utf8_raw(
+        ctx, value, out_len, &etc->utf8BytesObj);
+    if (!HPy_IsNull(etc->utf8BytesObj))
+    {
+      etc->has_resources = true;
+    }
+    return raw;
+  }
 }
 
 static const char *
@@ -781,7 +1162,14 @@ hpy_long_to_int64(JSOBJ obj, JSONTypeContext *tc, void *out_value, size_t *out_l
 {
   (void) obj;
   (void) out_len;
-  *((JSINT64 *) out_value) = hpy_encoder_type_context(tc)->longValue;
+  if (tc->prv == NULL)
+  {
+    *((JSINT64 *) out_value) = hpy_encoder_state(tc)->scalar.long_value;
+  }
+  else
+  {
+    *((JSINT64 *) out_value) = hpy_encoder_type_context(tc)->longValue;
+  }
   return NULL;
 }
 
@@ -790,16 +1178,33 @@ hpy_long_to_uint64(JSOBJ obj, JSONTypeContext *tc, void *out_value, size_t *out_
 {
   (void) obj;
   (void) out_len;
-  *((JSUINT64 *) out_value) = hpy_encoder_type_context(tc)->unsignedLongValue;
+  if (tc->prv == NULL)
+  {
+    *((JSUINT64 *) out_value) =
+        hpy_encoder_state(tc)->scalar.unsigned_long_value;
+  }
+  else
+  {
+    *((JSUINT64 *) out_value) =
+        hpy_encoder_type_context(tc)->unsignedLongValue;
+  }
   return NULL;
 }
 
 static void *
 hpy_float_to_double(JSOBJ obj, JSONTypeContext *tc, void *out_value, size_t *out_len)
 {
-  HPyContext *ctx = hpy_encoder_state(tc)->ctx;
   (void) out_len;
-  *((double *) out_value) = HPyFloat_AsDouble(ctx, hpy_encoder_get_obj_handle(obj, tc));
+  if (tc->prv == NULL)
+  {
+    *((double *) out_value) = hpy_encoder_state(tc)->scalar.double_value;
+  }
+  else
+  {
+    HPyContext *ctx = hpy_encoder_state(tc)->ctx;
+    *((double *) out_value) =
+        HPyFloat_AsDouble(ctx, hpy_encoder_get_obj_handle(obj, tc));
+  }
   return NULL;
 }
 
@@ -835,44 +1240,51 @@ hpy_object_is_float_type(HPyContext *ctx, HPy obj)
   return result;
 }
 
-static HPy
-hpy_dict_convert_key(HPyContext *ctx, HPy key)
+static int
+hpy_dict_prepare_key(HPyContext *ctx, HPy key, HpyEncoderTypeContext *etc)
 {
+  hpy_close_if_nonnull(ctx, etc->itemName);
+  etc->itemName = HPy_NULL;
+
   if (HPyUnicode_Check(ctx, key))
   {
-    return hpy_unicode_encode_surrogatepass(ctx, key);
+    etc->itemName = hpy_unicode_to_utf8_bytes(ctx, key);
+    return HPy_IsNull(etc->itemName) ? -1 : 0;
   }
 
   if (HPyBytes_Check(ctx, key))
   {
-    return HPy_Dup(ctx, key);
+    etc->itemName = HPy_Dup(ctx, key);
+    return HPy_IsNull(etc->itemName) ? -1 : 0;
   }
 
   if (HPy_Is(ctx, key, ctx->h_True))
   {
-    return HPyBytes_FromString(ctx, "true");
+    etc->itemName = HPyBytes_FromStringAndSize(ctx, "true", 4);
+    return HPy_IsNull(etc->itemName) ? -1 : 0;
   }
 
   if (HPy_Is(ctx, key, ctx->h_False))
   {
-    return HPyBytes_FromString(ctx, "false");
+    etc->itemName = HPyBytes_FromStringAndSize(ctx, "false", 5);
+    return HPy_IsNull(etc->itemName) ? -1 : 0;
   }
 
   if (HPy_Is(ctx, key, ctx->h_None))
   {
-    return HPyBytes_FromString(ctx, "null");
+    etc->itemName = HPyBytes_FromStringAndSize(ctx, "null", 4);
+    return HPy_IsNull(etc->itemName) ? -1 : 0;
   }
 
   {
     HPy key_str = HPy_Str(ctx, key);
-    HPy result;
     if (HPy_IsNull(key_str))
     {
-      return HPy_NULL;
+      return -1;
     }
-    result = hpy_unicode_encode_surrogatepass(ctx, key_str);
+    etc->itemName = hpy_unicode_to_utf8_bytes(ctx, key_str);
     HPy_Close(ctx, key_str);
-    return result;
+    return HPy_IsNull(etc->itemName) ? -1 : 0;
   }
 }
 
@@ -889,23 +1301,26 @@ hpy_tuple_iter_next(JSOBJ obj, JSONTypeContext *tc)
     return 0;
   }
 
-  if (etc->itemValue != NULL)
-  {
-    hpy_json_value_release_jsobj(ctx, etc->itemValue);
-    etc->itemValue = NULL;
-  }
-
+#ifdef HPY_ABI_CPYTHON
+  PyObject *py_item = PyTuple_GET_ITEM(_h2py(tuple), etc->index);
+  item = _py2h(py_item);
+#else
   item = HPy_GetItem_i(ctx, tuple, etc->index);
   if (HPy_IsNull(item))
   {
     return -1;
   }
+#endif
 
-  etc->itemValue = hpy_json_value_new(ctx, item);
-  if (etc->itemValue == NULL)
+#ifdef HPY_ABI_CPYTHON
+  if (hpy_json_value_replace_borrowed(ctx, &etc->itemValue, item) < 0)
+#else
+  if (hpy_json_value_replace_jsobj(ctx, &etc->itemValue, item) < 0)
+#endif
   {
     return -1;
   }
+  etc->has_resources = true;
 
   etc->index += 1;
   return 1;
@@ -914,12 +1329,16 @@ hpy_tuple_iter_next(JSOBJ obj, JSONTypeContext *tc)
 static void
 hpy_tuple_iter_end(JSOBJ obj, JSONTypeContext *tc)
 {
-  HPyContext *ctx = hpy_encoder_state(tc)->ctx;
   HpyEncoderTypeContext *etc = hpy_encoder_type_context(tc);
   (void) obj;
   if (etc->itemValue != NULL)
   {
+#ifdef HPY_ABI_CPYTHON
+    hpy_json_value_release_borrowed(etc->itemValue);
+#else
+    HPyContext *ctx = hpy_encoder_state(tc)->ctx;
     hpy_json_value_release_jsobj(ctx, etc->itemValue);
+#endif
     etc->itemValue = NULL;
   }
 }
@@ -934,7 +1353,39 @@ hpy_tuple_iter_get_value(JSOBJ obj, JSONTypeContext *tc)
 static int
 hpy_list_iter_next(JSOBJ obj, JSONTypeContext *tc)
 {
-  return hpy_tuple_iter_next(obj, tc);
+  HPyContext *ctx = hpy_encoder_state(tc)->ctx;
+  HpyEncoderTypeContext *etc = hpy_encoder_type_context(tc);
+  HPy list = hpy_encoder_get_obj_handle(obj, tc);
+  HPy item;
+
+  if (etc->index >= etc->size)
+  {
+    return 0;
+  }
+
+#ifdef HPY_ABI_CPYTHON
+  PyObject *py_item = PyList_GET_ITEM(_h2py(list), etc->index);
+  item = _py2h(py_item);
+#else
+  item = HPy_GetItem_i(ctx, list, etc->index);
+  if (HPy_IsNull(item))
+  {
+    return -1;
+  }
+#endif
+
+#ifdef HPY_ABI_CPYTHON
+  if (hpy_json_value_replace_borrowed(ctx, &etc->itemValue, item) < 0)
+#else
+  if (hpy_json_value_replace_jsobj(ctx, &etc->itemValue, item) < 0)
+#endif
+  {
+    return -1;
+  }
+  etc->has_resources = true;
+
+  etc->index += 1;
+  return 1;
 }
 
 static void
@@ -955,33 +1406,30 @@ hpy_dict_iter_next(JSOBJ obj, JSONTypeContext *tc)
   HPyContext *ctx = hpy_encoder_state(tc)->ctx;
   HpyEncoderTypeContext *etc = hpy_encoder_type_context(tc);
   HPy dict = etc->dictObj;
-  HPy keys = HPyDict_Keys(ctx, dict);
   HPy key = HPy_NULL;
   HPy value = HPy_NULL;
   int result = 0;
 
   (void) obj;
 
-  if (HPy_IsNull(keys))
-  {
-    return -1;
-  }
-
-  etc->size = HPy_Length(ctx, keys);
-  if (etc->size < 0)
-  {
-    HPy_Close(ctx, keys);
-    return -1;
-  }
-
   if (etc->index >= etc->size)
   {
-    HPy_Close(ctx, keys);
     return 0;
   }
 
-  key = HPy_GetItem_i(ctx, keys, etc->index);
-  HPy_Close(ctx, keys);
+#ifdef HPY_ABI_CPYTHON
+  {
+    PyObject *py_key = PyList_GET_ITEM(_h2py(etc->newObj), etc->index);
+    PyObject *py_value = PyDict_GetItem(_h2py(dict), py_key);
+    if (py_value == NULL)
+    {
+      return -1;
+    }
+    key = _py2h(py_key);
+    value = _py2h(py_value);
+  }
+#else
+  key = HPy_GetItem_i(ctx, etc->newObj, etc->index);
   if (HPy_IsNull(key))
   {
     return -1;
@@ -993,122 +1441,70 @@ hpy_dict_iter_next(JSOBJ obj, JSONTypeContext *tc)
     HPy_Close(ctx, key);
     return -1;
   }
+#endif
 
-  HPy_Close(ctx, etc->itemName);
-  etc->itemName = hpy_dict_convert_key(ctx, key);
-  if (HPy_IsNull(etc->itemName))
+  if (hpy_dict_prepare_key(ctx, key, etc) < 0)
   {
+#ifndef HPY_ABI_CPYTHON
     HPy_Close(ctx, value);
     HPy_Close(ctx, key);
+#endif
     return -1;
   }
 
-  if (etc->itemValue != NULL)
+#ifdef HPY_ABI_CPYTHON
+  if (hpy_json_value_replace_borrowed(ctx, &etc->itemValue, value) < 0)
+#else
+  if (hpy_json_value_replace_jsobj(ctx, &etc->itemValue, value) < 0)
+#endif
   {
-    hpy_json_value_release_jsobj(ctx, etc->itemValue);
-    etc->itemValue = NULL;
-  }
-
-  etc->itemValue = hpy_json_value_new(ctx, value);
-  if (etc->itemValue == NULL)
-  {
+#ifndef HPY_ABI_CPYTHON
     HPy_Close(ctx, key);
+#endif
     return -1;
   }
+  etc->has_resources = true;
 
+#ifndef HPY_ABI_CPYTHON
   HPy_Close(ctx, key);
+#endif
   etc->index += 1;
   result = 1;
   return result;
 }
 
+#ifdef HPY_ABI_CPYTHON
 static int
-hpy_sorted_dict_iter_next(JSOBJ obj, JSONTypeContext *tc)
+hpy_dict_iter_next_cpython_unsorted(JSOBJ obj, JSONTypeContext *tc)
 {
   HPyContext *ctx = hpy_encoder_state(tc)->ctx;
   HpyEncoderTypeContext *etc = hpy_encoder_type_context(tc);
-  HPy empty_args = HPy_NULL;
-  HPy key = HPy_NULL;
-  HPy value = HPy_NULL;
+  PyObject *py_key = NULL;
+  PyObject *py_value = NULL;
+  HPy value;
 
   (void) obj;
 
-  if (HPy_IsNull(etc->newObj))
-  {
-    HPy sort_result = HPy_NULL;
-    etc->newObj = HPyDict_Keys(ctx, etc->dictObj);
-    if (HPy_IsNull(etc->newObj))
-    {
-      return -1;
-    }
-
-    empty_args = HPyTuple_FromArray(ctx, NULL, 0);
-    if (HPy_IsNull(empty_args))
-    {
-      return -1;
-    }
-
-    sort_result = HPy_CallMethodTupleDict_s(ctx, "sort", etc->newObj, empty_args,
-                                            HPy_NULL);
-    if (HPy_IsNull(sort_result))
-    {
-      HPy_Close(ctx, empty_args);
-      return -1;
-    }
-    HPy_Close(ctx, sort_result);
-    HPy_Close(ctx, empty_args);
-
-    etc->size = HPy_Length(ctx, etc->newObj);
-    if (etc->size < 0)
-    {
-      return -1;
-    }
-  }
-
-  if (etc->index >= etc->size)
+  if (!PyDict_Next(_h2py(etc->dictObj), (Py_ssize_t *) &etc->index, &py_key, &py_value))
   {
     return 0;
   }
 
-  key = HPy_GetItem_i(ctx, etc->newObj, etc->index);
-  if (HPy_IsNull(key))
+  if (hpy_dict_prepare_key(ctx, _py2h(py_key), etc) < 0)
   {
     return -1;
   }
 
-  value = HPy_GetItem(ctx, etc->dictObj, key);
-  if (HPy_IsNull(value))
+  value = _py2h(py_value);
+  if (hpy_json_value_replace_borrowed(ctx, &etc->itemValue, value) < 0)
   {
-    HPy_Close(ctx, key);
     return -1;
   }
+  etc->has_resources = true;
 
-  HPy_Close(ctx, etc->itemName);
-  etc->itemName = hpy_dict_convert_key(ctx, key);
-  if (HPy_IsNull(etc->itemName))
-  {
-    HPy_Close(ctx, value);
-    HPy_Close(ctx, key);
-    return -1;
-  }
-
-  if (etc->itemValue != NULL)
-  {
-    hpy_json_value_release_jsobj(ctx, etc->itemValue);
-    etc->itemValue = NULL;
-  }
-
-  etc->itemValue = hpy_json_value_new(ctx, value);
-  if (etc->itemValue == NULL)
-  {
-    HPy_Close(ctx, key);
-    return -1;
-  }
-
-  HPy_Close(ctx, key);
-  etc->index += 1;
   return 1;
 }
+#endif
 
 static void
 hpy_dict_iter_end(JSOBJ obj, JSONTypeContext *tc)
@@ -1119,12 +1515,16 @@ hpy_dict_iter_end(JSOBJ obj, JSONTypeContext *tc)
 
   if (etc->itemValue != NULL)
   {
+#ifdef HPY_ABI_CPYTHON
+    hpy_json_value_release_borrowed(etc->itemValue);
+#else
     hpy_json_value_release_jsobj(ctx, etc->itemValue);
+#endif
     etc->itemValue = NULL;
   }
-  HPy_Close(ctx, etc->itemName);
+  hpy_close_if_nonnull(ctx, etc->itemName);
   etc->itemName = HPy_NULL;
-  HPy_Close(ctx, etc->dictObj);
+  hpy_close_if_nonnull(ctx, etc->dictObj);
   etc->dictObj = HPy_NULL;
 }
 
@@ -1140,33 +1540,188 @@ hpy_dict_iter_get_name(JSOBJ obj, JSONTypeContext *tc, size_t *out_len)
 {
   HPyContext *ctx = hpy_encoder_state(tc)->ctx;
   HpyEncoderTypeContext *etc = hpy_encoder_type_context(tc);
-  HPy_ssize_t len = HPyBytes_Size(ctx, etc->itemName);
   (void) obj;
-  if (len < 0)
+
   {
-    return NULL;
+    HPy_ssize_t len = HPyBytes_Size(ctx, etc->itemName);
+    if (len < 0)
+    {
+      return NULL;
+    }
+    *out_len = (size_t) len;
+    return (char *) HPyBytes_AsString(ctx, etc->itemName);
   }
-  *out_len = (size_t) len;
-  return (char *) HPyBytes_AsString(ctx, etc->itemName);
 }
 
 static int
 hpy_setup_dict_iter(HPyContext *ctx, HPy dict_obj, HpyEncoderTypeContext *etc,
                     JSONObjectEncoder *enc)
 {
+  HPy sort_method = HPy_NULL;
+  HPy sort_result = HPy_NULL;
+
   etc->dictObj = HPy_Dup(ctx, dict_obj);
   if (HPy_IsNull(etc->dictObj))
   {
     return -1;
   }
 
-  etc->iterNext = enc->sortKeys ? hpy_sorted_dict_iter_next : hpy_dict_iter_next;
+#ifdef HPY_ABI_CPYTHON
+  if (!enc->sortKeys)
+  {
+    etc->iterNext = hpy_dict_iter_next_cpython_unsorted;
+    etc->iterEnd = hpy_dict_iter_end;
+    etc->iterGetValue = hpy_dict_iter_get_value;
+    etc->iterGetName = hpy_dict_iter_get_name;
+    etc->index = 0;
+    etc->size = 0;
+    return 0;
+  }
+#endif
+
+  etc->newObj = HPyDict_Keys(ctx, dict_obj);
+  if (HPy_IsNull(etc->newObj))
+  {
+    HPy_Close(ctx, etc->dictObj);
+    etc->dictObj = HPy_NULL;
+    return -1;
+  }
+
+  if (enc->sortKeys)
+  {
+    sort_method = HPy_GetAttr_s(ctx, etc->newObj, "sort");
+    if (HPy_IsNull(sort_method))
+    {
+      HPy_Close(ctx, etc->newObj);
+      HPy_Close(ctx, etc->dictObj);
+      etc->newObj = HPy_NULL;
+      etc->dictObj = HPy_NULL;
+      return -1;
+    }
+
+    sort_result = HPy_Call(ctx, sort_method, NULL, 0, HPy_NULL);
+    HPy_Close(ctx, sort_method);
+    if (HPy_IsNull(sort_result))
+    {
+      HPy_Close(ctx, etc->newObj);
+      HPy_Close(ctx, etc->dictObj);
+      etc->newObj = HPy_NULL;
+      etc->dictObj = HPy_NULL;
+      return -1;
+    }
+    HPy_Close(ctx, sort_result);
+  }
+
+  etc->size = HPy_Length(ctx, etc->newObj);
+  if (etc->size < 0)
+  {
+    HPy_Close(ctx, etc->newObj);
+    HPy_Close(ctx, etc->dictObj);
+    etc->newObj = HPy_NULL;
+    etc->dictObj = HPy_NULL;
+    return -1;
+  }
+
+  etc->iterNext = hpy_dict_iter_next;
   etc->iterEnd = hpy_dict_iter_end;
   etc->iterGetValue = hpy_dict_iter_get_value;
   etc->iterGetName = hpy_dict_iter_get_name;
   etc->index = 0;
-  etc->size = 0;
   return 0;
+}
+
+enum HpyScalarClassification {
+  HPY_SCALAR_ERROR = -1,
+  HPY_NOT_SCALAR = 0,
+  HPY_SCALAR_HANDLED = 1,
+  HPY_SCALAR_NEEDS_CONTEXT = 2,
+};
+
+static int
+hpy_encoder_classify_scalar(HpyEncoderState *state, HPy value,
+                            JSONTypeContext *tc, JSONObjectEncoder *enc)
+{
+  HPyContext *ctx = state->ctx;
+
+  if (HPy_Is(ctx, value, ctx->h_True))
+  {
+    tc->type = JT_TRUE;
+    return HPY_SCALAR_HANDLED;
+  }
+
+  if (HPy_Is(ctx, value, ctx->h_False))
+  {
+    tc->type = JT_FALSE;
+    return HPY_SCALAR_HANDLED;
+  }
+
+  if (HPy_TypeCheck(ctx, value, ctx->h_LongType))
+  {
+    state->scalar.long_value = (JSINT64) HPyLong_AsLongLong(ctx, value);
+    if (!(state->scalar.long_value == -1 && HPyErr_Occurred(ctx)))
+    {
+      tc->type = JT_LONG;
+      return HPY_SCALAR_HANDLED;
+    }
+    if (!HPyErr_ExceptionMatches(ctx, ctx->h_OverflowError))
+    {
+      return HPY_SCALAR_ERROR;
+    }
+    HPyErr_Clear(ctx);
+
+    state->scalar.unsigned_long_value =
+        (JSUINT64) HPyLong_AsUnsignedLongLong(ctx, value);
+    if (!(state->scalar.unsigned_long_value == (JSUINT64) -1 &&
+          HPyErr_Occurred(ctx)))
+    {
+      tc->type = JT_ULONG;
+      return HPY_SCALAR_HANDLED;
+    }
+    if (!HPyErr_ExceptionMatches(ctx, ctx->h_OverflowError))
+    {
+      return HPY_SCALAR_ERROR;
+    }
+    HPyErr_Clear(ctx);
+    return HPY_SCALAR_NEEDS_CONTEXT;
+  }
+
+  if (HPyBytes_Check(ctx, value))
+  {
+    if (enc->rejectBytes)
+    {
+      HPyErr_SetString(ctx, ctx->h_TypeError,
+                       "reject_bytes is on and bytes is bytes");
+      return HPY_SCALAR_ERROR;
+    }
+    tc->type = JT_UTF8;
+    return HPY_SCALAR_HANDLED;
+  }
+
+  if (HPyUnicode_Check(ctx, value))
+  {
+    tc->type = JT_UTF8;
+    return HPY_SCALAR_HANDLED;
+  }
+
+  if (HPy_Is(ctx, value, ctx->h_None))
+  {
+    tc->type = JT_NULL;
+    return HPY_SCALAR_HANDLED;
+  }
+
+  if (hpy_object_is_float_type(ctx, value) ||
+      hpy_object_is_decimal_type(ctx, value))
+  {
+    state->scalar.double_value = HPyFloat_AsDouble(ctx, value);
+    if (state->scalar.double_value == -1.0 && HPyErr_Occurred(ctx))
+    {
+      return HPY_SCALAR_ERROR;
+    }
+    tc->type = JT_DOUBLE;
+    return HPY_SCALAR_HANDLED;
+  }
+
+  return HPY_NOT_SCALAR;
 }
 
 static void
@@ -1175,34 +1730,43 @@ hpy_encoder_begin_type_context(JSOBJ obj, JSONTypeContext *tc, JSONObjectEncoder
   HpyEncoderState *state = (HpyEncoderState *) tc->encoder_prv;
   HPyContext *ctx = state->ctx;
   HpyEncoderTypeContext *etc;
+  HPy method = HPy_NULL;
   HPy value = HPy_NULL;
+  int scalar_result;
   int level = 0;
 
-  tc->prv = malloc(sizeof(HpyEncoderTypeContext));
-  etc = hpy_encoder_type_context(tc);
-  if (etc == NULL)
-  {
-    tc->type = JT_INVALID;
-    HPyErr_NoMemory(ctx);
-    return;
-  }
-
-  memset(etc, 0, sizeof(*etc));
-  etc->newObj = HPy_NULL;
-  etc->utf8BytesObj = HPy_NULL;
-  etc->dictObj = HPy_NULL;
-  etc->itemName = HPy_NULL;
-  etc->rawJSONValue = HPy_NULL;
+  tc->prv = NULL;
 
   if (obj == NULL)
   {
     tc->type = JT_INVALID;
-    hpy_encoder_type_context_cleanup(ctx, etc);
-    tc->prv = NULL;
     return;
   }
 
   value = hpy_json_handle_from_jsobj(obj);
+  scalar_result = hpy_encoder_classify_scalar(state, value, tc, enc);
+  if (scalar_result == HPY_SCALAR_HANDLED)
+  {
+    return;
+  }
+  if (scalar_result == HPY_SCALAR_ERROR)
+  {
+    tc->type = JT_INVALID;
+    return;
+  }
+
+  etc = hpy_encoder_alloc_type_context(state);
+  if (etc == NULL)
+  {
+    tc->type = JT_INVALID;
+    return;
+  }
+  tc->prv = etc;
+
+  if (scalar_result == HPY_NOT_SCALAR)
+  {
+    goto COMPLEX;
+  }
 
 BEGIN:
   if (HPy_Is(ctx, value, ctx->h_True))
@@ -1251,6 +1815,7 @@ BEGIN:
     {
       goto INVALID;
     }
+    etc->has_resources = true;
     tc->type = JT_RAW;
     return;
   }
@@ -1285,12 +1850,14 @@ BEGIN:
     return;
   }
 
+COMPLEX:
   if (HPyDict_Check(ctx, value))
   {
     if (hpy_setup_dict_iter(ctx, value, etc, enc) < 0)
     {
       goto INVALID;
     }
+    etc->has_resources = true;
     tc->type = JT_OBJECT;
     return;
   }
@@ -1301,11 +1868,15 @@ BEGIN:
     etc->iterNext = hpy_list_iter_next;
     etc->iterGetValue = hpy_list_iter_get_value;
     etc->index = 0;
+#ifdef HPY_ABI_CPYTHON
+    etc->size = PyList_GET_SIZE(_h2py(value));
+#else
     etc->size = HPy_Length(ctx, value);
     if (etc->size < 0)
     {
       goto INVALID;
     }
+#endif
     tc->type = JT_ARRAY;
     return;
   }
@@ -1316,32 +1887,31 @@ BEGIN:
     etc->iterNext = hpy_tuple_iter_next;
     etc->iterGetValue = hpy_tuple_iter_get_value;
     etc->index = 0;
+#ifdef HPY_ABI_CPYTHON
+    etc->size = PyTuple_GET_SIZE(_h2py(value));
+#else
     etc->size = HPy_Length(ctx, value);
     if (etc->size < 0)
     {
       goto INVALID;
     }
+#endif
     tc->type = JT_ARRAY;
     return;
   }
 
   {
-    int has_to_dict = HPy_HasAttr_s(ctx, value, "toDict");
+    int has_to_dict = hpy_maybe_get_attr_s(ctx, value, "toDict", &method);
     if (has_to_dict < 0)
     {
       goto INVALID;
     }
     if (has_to_dict)
     {
-      HPy empty_args = HPyTuple_FromArray(ctx, NULL, 0);
       HPy to_dict_result;
-      if (HPy_IsNull(empty_args))
-      {
-        goto INVALID;
-      }
-      to_dict_result = HPy_CallMethodTupleDict_s(ctx, "toDict", value, empty_args,
-                                                 HPy_NULL);
-      HPy_Close(ctx, empty_args);
+      to_dict_result = HPy_Call(ctx, method, NULL, 0, HPy_NULL);
+      HPy_Close(ctx, method);
+      method = HPy_NULL;
       if (HPy_IsNull(to_dict_result))
       {
         goto INVALID;
@@ -1358,6 +1928,7 @@ BEGIN:
         HPy_Close(ctx, to_dict_result);
         goto INVALID;
       }
+      etc->has_resources = true;
       HPy_Close(ctx, to_dict_result);
       tc->type = JT_OBJECT;
       return;
@@ -1365,25 +1936,21 @@ BEGIN:
   }
 
   {
-    int has_json = HPy_HasAttr_s(ctx, value, "__json__");
+    int has_json = hpy_maybe_get_attr_s(ctx, value, "__json__", &method);
     if (has_json < 0)
     {
       goto INVALID;
     }
     if (has_json)
     {
-      HPy empty_args = HPyTuple_FromArray(ctx, NULL, 0);
-      if (HPy_IsNull(empty_args))
-      {
-        goto INVALID;
-      }
-      etc->rawJSONValue =
-          HPy_CallMethodTupleDict_s(ctx, "__json__", value, empty_args, HPy_NULL);
-      HPy_Close(ctx, empty_args);
+      etc->rawJSONValue = HPy_Call(ctx, method, NULL, 0, HPy_NULL);
+      HPy_Close(ctx, method);
+      method = HPy_NULL;
       if (HPy_IsNull(etc->rawJSONValue))
       {
         goto INVALID;
       }
+      etc->has_resources = true;
       if (!HPyBytes_Check(ctx, etc->rawJSONValue) &&
           !HPyUnicode_Check(ctx, etc->rawJSONValue))
       {
@@ -1407,13 +1974,8 @@ BEGIN:
     }
 
     {
-      HPy args = HPyTuple_Pack(ctx, 1, value);
-      if (HPy_IsNull(args))
-      {
-        goto INVALID;
-      }
-      new_obj = HPy_CallTupleDict(ctx, state->default_fn, args, HPy_NULL);
-      HPy_Close(ctx, args);
+      HPy args[] = {value};
+      new_obj = HPy_Call(ctx, state->default_fn, args, 1, HPy_NULL);
     }
     if (HPy_IsNull(new_obj))
     {
@@ -1422,6 +1984,7 @@ BEGIN:
 
     HPy_Close(ctx, etc->newObj);
     etc->newObj = new_obj;
+    etc->has_resources = true;
     value = etc->newObj;
     level += 1;
     goto BEGIN;
@@ -1451,22 +2014,22 @@ BEGIN:
   }
 
 INVALID:
+  HPy_Close(ctx, method);
   tc->type = JT_INVALID;
-  hpy_encoder_type_context_cleanup(ctx, etc);
+  hpy_encoder_type_context_cleanup_for_state(state, etc);
   tc->prv = NULL;
 }
 
 static void
 hpy_encoder_end_type_context(JSOBJ obj, JSONTypeContext *tc)
 {
-  HPyContext *ctx = hpy_encoder_state(tc)->ctx;
   HpyEncoderTypeContext *etc = hpy_encoder_type_context(tc);
   (void) obj;
   if (etc == NULL)
   {
     return;
   }
-  hpy_encoder_type_context_cleanup(ctx, etc);
+  hpy_encoder_type_context_cleanup_for_state(hpy_encoder_state(tc), etc);
   tc->prv = NULL;
 }
 
@@ -1585,6 +2148,8 @@ hpy_encode_python_object(HPyContext *ctx, HPy input, HPy default_fn,
   HpyEncoderState state = {
     .ctx = ctx,
     .default_fn = default_fn,
+    .free_type_contexts = NULL,
+    .type_context_blocks = NULL,
   };
   JSONObjectEncoder encoder = {0};
 
@@ -1626,6 +2191,7 @@ hpy_encode_python_object(HPyContext *ctx, HPy input, HPy default_fn,
     {
       HPyErr_SetString(ctx, ctx->h_TypeError,
                        "expected tuple or None as separator");
+      hpy_encoder_cleanup_type_context_pool(&state);
       return HPy_NULL;
     }
 
@@ -1633,18 +2199,21 @@ hpy_encode_python_object(HPyContext *ctx, HPy input, HPy default_fn,
     {
       HPyErr_SetString(ctx, ctx->h_ValueError,
                        "expected tuple of size 2 as separator");
+      hpy_encoder_cleanup_type_context_pool(&state);
       return HPy_NULL;
     }
 
     item_sep = HPy_GetItem_i(ctx, separators, 0);
     if (HPy_IsNull(item_sep))
     {
+      hpy_encoder_cleanup_type_context_pool(&state);
       return HPy_NULL;
     }
     key_sep = HPy_GetItem_i(ctx, separators, 1);
     if (HPy_IsNull(key_sep))
     {
       HPy_Close(ctx, item_sep);
+      hpy_encoder_cleanup_type_context_pool(&state);
       return HPy_NULL;
     }
 
@@ -1653,6 +2222,7 @@ hpy_encode_python_object(HPyContext *ctx, HPy input, HPy default_fn,
       HPy_Close(ctx, item_sep);
       HPy_Close(ctx, key_sep);
       HPyErr_SetString(ctx, ctx->h_TypeError, "expected str as item separator");
+      hpy_encoder_cleanup_type_context_pool(&state);
       return HPy_NULL;
     }
     if (!HPyUnicode_Check(ctx, key_sep))
@@ -1660,27 +2230,50 @@ hpy_encode_python_object(HPyContext *ctx, HPy input, HPy default_fn,
       HPy_Close(ctx, item_sep);
       HPy_Close(ctx, key_sep);
       HPyErr_SetString(ctx, ctx->h_TypeError, "expected str as key separator");
+      hpy_encoder_cleanup_type_context_pool(&state);
       return HPy_NULL;
     }
 
-    encoder.itemSeparatorChars =
-        hpy_unicode_to_utf8_raw(ctx, item_sep, &encoder.itemSeparatorLength,
-                                &item_sep_bytes);
+    item_sep_bytes = hpy_unicode_to_utf8_bytes(ctx, item_sep);
     HPy_Close(ctx, item_sep);
-    if (encoder.itemSeparatorChars == NULL)
+    if (HPy_IsNull(item_sep_bytes))
     {
       HPy_Close(ctx, key_sep);
+      hpy_encoder_cleanup_type_context_pool(&state);
       return HPy_NULL;
     }
+    {
+      HPy_ssize_t item_sep_len = HPyBytes_Size(ctx, item_sep_bytes);
+      encoder.itemSeparatorChars = HPyBytes_AsString(ctx, item_sep_bytes);
+      if (item_sep_len < 0 || encoder.itemSeparatorChars == NULL)
+      {
+        HPy_Close(ctx, key_sep);
+        HPy_Close(ctx, item_sep_bytes);
+        hpy_encoder_cleanup_type_context_pool(&state);
+        return HPy_NULL;
+      }
+      encoder.itemSeparatorLength = (size_t) item_sep_len;
+    }
 
-    encoder.keySeparatorChars =
-        hpy_unicode_to_utf8_raw(ctx, key_sep, &encoder.keySeparatorLength,
-                                &key_sep_bytes);
+    key_sep_bytes = hpy_unicode_to_utf8_bytes(ctx, key_sep);
     HPy_Close(ctx, key_sep);
-    if (encoder.keySeparatorChars == NULL)
+    if (HPy_IsNull(key_sep_bytes))
     {
       HPy_Close(ctx, item_sep_bytes);
+      hpy_encoder_cleanup_type_context_pool(&state);
       return HPy_NULL;
+    }
+    {
+      HPy_ssize_t key_sep_len = HPyBytes_Size(ctx, key_sep_bytes);
+      encoder.keySeparatorChars = HPyBytes_AsString(ctx, key_sep_bytes);
+      if (key_sep_len < 0 || encoder.keySeparatorChars == NULL)
+      {
+        HPy_Close(ctx, item_sep_bytes);
+        HPy_Close(ctx, key_sep_bytes);
+        hpy_encoder_cleanup_type_context_pool(&state);
+        return HPy_NULL;
+      }
+      encoder.keySeparatorLength = (size_t) key_sep_len;
     }
   }
   else
@@ -1712,6 +2305,7 @@ hpy_encode_python_object(HPyContext *ctx, HPy input, HPy default_fn,
     dconv_d2s_free(&encoder.d2s);
     HPy_Close(ctx, item_sep_bytes);
     HPy_Close(ctx, key_sep_bytes);
+    hpy_encoder_cleanup_type_context_pool(&state);
     return HPy_NULL;
   }
 
@@ -1732,6 +2326,7 @@ hpy_encode_python_object(HPyContext *ctx, HPy input, HPy default_fn,
     {
       encoder.free(ret);
     }
+    hpy_encoder_cleanup_type_context_pool(&state);
     return HPy_NULL;
   }
 
@@ -1741,6 +2336,7 @@ hpy_encode_python_object(HPyContext *ctx, HPy input, HPy default_fn,
     {
       encoder.free(ret);
     }
+    hpy_encoder_cleanup_type_context_pool(&state);
     return HPy_NULL;
   }
 
@@ -1751,11 +2347,13 @@ hpy_encode_python_object(HPyContext *ctx, HPy input, HPy default_fn,
   }
   if (HPy_IsNull(encoded_result))
   {
+    hpy_encoder_cleanup_type_context_pool(&state);
     return HPy_NULL;
   }
   result = HPyUnicode_FromEncodedObject(ctx, encoded_result, "utf-8",
                                         "surrogatepass");
   HPy_Close(ctx, encoded_result);
+  hpy_encoder_cleanup_type_context_pool(&state);
   return result;
 }
 

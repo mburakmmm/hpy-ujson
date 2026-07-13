@@ -52,6 +52,7 @@ The HPy-focused test suites can be run with:
 ```sh
 ./scripts/hpy-test.sh cpython
 ./scripts/hpy-test.sh universal
+HPY=debug ./scripts/hpy-test.sh universal
 ```
 
 Or through `tox`:
@@ -60,6 +61,21 @@ Or through `tox`:
 tox -e hpy-cpython
 tox -e hpy-universal
 tox -e lint
+```
+
+For performance work, use the benchmark matrix helper instead of ad-hoc loops:
+
+```sh
+./scripts/hpy-benchmark-matrix.sh cpython --repeat 9 --min-time 0.10
+./scripts/hpy-benchmark-matrix.sh universal --repeat 9 --min-time 0.10
+```
+
+If you touch host-runtime-facing behavior, also run the isolated artifact smoke
+checks:
+
+```sh
+./scripts/hpy-smoke.sh cpython
+./scripts/hpy-smoke.sh universal
 ```
 
 ## Git Workflow
@@ -97,6 +113,8 @@ Before opening a pull request, please verify:
 - local virtualenv and editor files are not committed
 - behavior changes include tests
 - HPy changes were checked in both `cpython` and `universal` modes when relevant
+- HPy runtime or performance changes include benchmark notes when the claim is
+  performance-sensitive
 - user-facing documentation was updated when the API or workflow changed
 
 If the change affects the HPy surface, include the exact commands you ran in the
@@ -111,6 +129,7 @@ Please do not commit:
 - local editor configuration
 - benchmark scratch files
 - personal notes or runtime-specific experiments unrelated to this repository
+- local HPy source trees used only for patch validation
 
 The repository `.gitignore` covers the usual local artifacts, but please check
 `git status` before committing.
@@ -126,6 +145,8 @@ Useful references:
 - [README.md](./README.md)
 - [docs/hpy-port-plan.md](./docs/hpy-port-plan.md)
 - [docs/ujson-hpy-api.md](./docs/ujson-hpy-api.md)
+- [docs/hpy-performance-plan.md](./docs/hpy-performance-plan.md)
+- [docs/hpy-getitem-i-fastpath.md](./docs/hpy-getitem-i-fastpath.md)
 
 ## Reporting Issues
 

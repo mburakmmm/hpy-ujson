@@ -1,0 +1,89 @@
+diff --git a/hpy/devel/src/runtime/ctx_object.c b/hpy/devel/src/runtime/ctx_object.c
+index dc6ee2b..f2f1f57 100644
+--- a/hpy/devel/src/runtime/ctx_object.c
++++ b/hpy/devel/src/runtime/ctx_object.c
+@@ -34,10 +34,42 @@ ctx_Is(HPyContext *ctx, HPy h_obj, HPy h_other)
+ 
+ _HPy_HIDDEN HPy
+ ctx_GetItem_i(HPyContext *ctx, HPy obj, HPy_ssize_t idx) {
++    PyObject *py_obj = _h2py(obj);
++#ifndef Py_GIL_DISABLED
++    if (PyList_CheckExact(py_obj)) {
++        Py_ssize_t size = PyList_GET_SIZE(py_obj);
++        PyObject *item;
++        if (idx < 0)
++            idx += size;
++        if (idx < 0 || idx >= size) {
++            PyErr_SetString(PyExc_IndexError, "list index out of range");
++            return HPy_NULL;
++        }
++        item = PyList_GET_ITEM(py_obj, idx);
++        Py_INCREF(item);
++        return _py2h(item);
++    }
++#endif
++    if (PyTuple_CheckExact(py_obj)) {
++        Py_ssize_t size = PyTuple_GET_SIZE(py_obj);
++        PyObject *item;
++        if (idx < 0)
++            idx += size;
++        if (idx < 0 || idx >= size) {
++            PyErr_SetString(PyExc_IndexError, "tuple index out of range");
++            return HPy_NULL;
++        }
++        item = PyTuple_GET_ITEM(py_obj, idx);
++        Py_INCREF(item);
++        return _py2h(item);
++    }
++    if (PySequence_Check(py_obj))
++        return _py2h(PySequence_GetItem(py_obj, idx));
++
+     PyObject* key = PyLong_FromSsize_t(idx);
+     if (key == NULL)
+         return HPy_NULL;
+-    HPy result = _py2h(PyObject_GetItem(_h2py(obj), key));
++    HPy result = _py2h(PyObject_GetItem(py_obj, key));
+     Py_DECREF(key);
+     return result;
+ }
+diff --git a/test/test_object.py b/test/test_object.py
+index 76b0301..1958f79 100644
+--- a/test/test_object.py
++++ b/test/test_object.py
+@@ -507,6 +507,36 @@ class TestObject(HPyTest):
+         with pytest.raises(IndexError):
+             mod.f([])
+ 
++    def test_getitem_i_sequence_semantics(self):
++        import pytest
++        mod = self.make_module("""
++            HPyDef_METH(f, "f", HPyFunc_O)
++            static HPy f_impl(HPyContext *ctx, HPy self, HPy arg)
++            {
++                return HPy_GetItem_i(ctx, arg, -1);
++            }
++            @EXPORT(f)
++            @INIT
++        """)
++
++        assert mod.f(["first", "last"]) == "last"
++        assert mod.f(("first", "last")) == "last"
++        with pytest.raises(IndexError):
++            mod.f([])
++        with pytest.raises(IndexError):
++            mod.f(())
++
++        class CustomList(list):
++            def __getitem__(self, key):
++                return ("list override", key)
++
++        class CustomTuple(tuple):
++            def __getitem__(self, key):
++                return ("tuple override", key)
++
++        assert mod.f(CustomList()) == ("list override", -1)
++        assert mod.f(CustomTuple()) == ("tuple override", -1)
++
+     def test_getitem_s(self):
+         import pytest
+         mod = self.make_module("""
