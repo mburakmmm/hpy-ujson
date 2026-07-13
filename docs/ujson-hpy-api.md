@@ -196,6 +196,35 @@ json.loads(text) -> value
 json.dumps(value) -> text
 ```
 
+### Example host flow
+
+Generic host pseudocode:
+
+```text
+artifact = hpy.load_module("ujson_hpy.hpy0.so")
+module = hpy.init_module("ujson_hpy", artifact)
+loads = module.get_attr("loads")
+dumps = module.get_attr("dumps")
+value = loads("{\"answer\":42}")
+text = dumps(value)
+```
+
+Nox-style wrapper sketch:
+
+```text
+module json {
+    let _ujson = hpy.import_module("ujson_hpy", "/abs/path/ujson_hpy.hpy0.so")
+
+    fn loads(text: str) -> Dynamic {
+        return _ujson.loads(text)
+    }
+
+    fn dumps(value: Dynamic) -> str {
+        return _ujson.dumps(value)
+    }
+}
+```
+
 ## Host Requirements
 
 To run this module outside CPython, the HPy host must support more than basic

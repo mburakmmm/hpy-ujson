@@ -199,6 +199,80 @@ replacement package.
 For the exported API, universal build artifacts, and non-CPython host
 integration guidance, see [`docs/ujson-hpy-api.md`](./docs/ujson-hpy-api.md).
 
+### External artifact validation
+
+The following commands build the HPy artifact and exercise it through an
+isolated import path, which is closer to how a non-CPython host would consume
+the universal build:
+
+```sh
+./scripts/hpy-smoke.sh universal
+./scripts/hpy-smoke.sh cpython
+```
+
+Verified locally on July 13, 2026:
+
+- `ujson_hpy external smoke check passed` with `abi=universal`
+- `ujson_hpy external smoke check passed` with `abi=cpython`
+
+### External host examples
+
+Import the built universal artifact directly from CPython:
+
+```sh
+./scripts/hpy-build.sh universal
+PYTHONPATH=build/hpy-universal/lib .venv/bin/python -c 'import ujson_hpy; print(ujson_hpy.loads("{\"ok\":true,\"items\":[1,2]}"))'
+```
+
+Generic HPy-host flow:
+
+```text
+artifact = hpy.load_module("build/hpy-universal/lib/ujson_hpy.hpy0.so")
+module = hpy.init_module("ujson_hpy", artifact)
+loads = module.get_attr("loads")
+dumps = module.get_attr("dumps")
+value = loads("{\"answer\":42}")
+text = dumps(value)
+```
+
+Nox-style wrapper sketch:
+
+```text
+module json {
+    let _ujson = hpy.import_module("ujson_hpy", "build/hpy-universal/lib/ujson_hpy.hpy0.so")
+
+    fn loads(text: str) -> Dynamic {
+        return _ujson.loads(text)
+    }
+
+    fn dumps(value: Dynamic) -> str {
+        return _ujson.dumps(value)
+    }
+}
+```
+
+### Local HPy benchmark snapshot
+
+The helper below benchmarks the built artifact against `json` and, when
+available in the local environment, classic `ujson`:
+
+```sh
+./scripts/hpy-benchmark.sh universal --loops 20000 --repeat 5
+```
+
+Local run on July 13, 2026, on `macOS-26.5.2-arm64-arm-64bit-Mach-O` with
+`CPython 3.14.2` and the universal ABI:
+
+| benchmark | json | ujson_hpy | ujson |
+| --- | --- | --- | --- |
+| dumps compact | 483,933 ops/s | 191,812 ops/s | 1,182,686 ops/s |
+| loads compact | 777,200 ops/s | 654,594 ops/s | 1,330,842 ops/s |
+| dumps sort_keys | 396,260 ops/s | 176,955 ops/s | 828,223 ops/s |
+
+These figures are machine-specific, but they provide a reproducible baseline
+for this repository and prove that the built universal artifact runs outside the
+default in-tree import path.
+
 ## Contributing
 
 Contributor workflow, test commands, and git hygiene guidance live in
