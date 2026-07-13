@@ -1,4 +1,4 @@
-# UltraJSON
+# hpy-ujson
 
 [![PyPI version](https://img.shields.io/pypi/v/ujson.svg?logo=pypi&logoColor=FFE873)](https://pypi.org/project/ujson)
 [![Supported Python versions](https://img.shields.io/pypi/pyversions/ujson.svg?logo=python&logoColor=FFE873)](https://pypi.org/project/ujson)
@@ -8,8 +8,8 @@
 [![DOI](https://zenodo.org/badge/1418941.svg)](https://zenodo.org/badge/latestdoi/1418941)
 [![Code style: Black](https://img.shields.io/badge/code%20style-Black-000000.svg)](https://github.com/psf/black)
 
-UltraJSON is an ultra fast JSON encoder and decoder written in pure C with bindings for
-Python.
+`hpy-ujson` is an HPy-oriented fork of UltraJSON: an ultra fast JSON encoder
+and decoder written in pure C with bindings for Python and HPy hosts.
 
 Install with pip:
 
