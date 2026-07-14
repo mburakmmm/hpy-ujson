@@ -1,45 +1,40 @@
 name: Benchmark
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     paths:
       - ".github/workflows/benchmark.yml"
-      - "tests/benchmark.py"
+      - "scripts/hpy-benchmark-matrix.sh"
+      - "scripts/hpy_benchmark_matrix.py"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
+  benchmark:
+    name: HPy ${{ matrix.abi }} benchmark
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11"]
-        os: [ubuntu-22.04]
+        abi: [cpython, universal]
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - run: git fetch --prune --unshallow
-
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.14"
           cache: pip
-          cache-dependency-path: "setup.py"
+          cache-dependency-path: pyproject.toml
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --upgrade orjson simplejson
-          python -m pip install .
+          python -m pip install --upgrade setuptools setuptools-scm "hpy>=0.9,<0.10"
 
-      - name: Tests
-        shell: bash
-        run: |
-          python tests/benchmark.py
+      - name: Benchmark
+        run: ./scripts/hpy-benchmark-matrix.sh ${{ matrix.abi }} --repeat 9 --min-time 0.10
+        env:
+          PYTHON: python

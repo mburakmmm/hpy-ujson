@@ -119,8 +119,9 @@ Acceptance criteria:
 
 Current repository state:
 
-- HPy bootstrap build is opt-in via `UJSON_BUILD_HPY=1`.
-- HPy builds now default to producing only `ujson_hpy`.
+- The default package build produces only the HPy CPython ABI `ujson_hpy`
+  module.
+- Universal artifacts remain explicit via `--hpy-abi=universal`.
 - Set `UJSON_BUILD_CPYTHON_EXT=1` to also build the classic `ujson` extension
   in the same invocation when a side-by-side comparison is useful.
 - Verified command for the current workspace:
@@ -361,8 +362,8 @@ Recommended Phase 6 outcome:
 
 1. Treat a clean HPy-focused fork as the primary delivery vehicle.
 2. Treat upstream contribution as a secondary, opportunistic track.
-3. Keep the fork import surface explicit (`ujson_hpy`) until a full packaging
-   decision and compatibility contract are published.
+3. Keep the fork import surface explicit (`ujson_hpy`) under the separate
+   `hpy-ujson` distribution contract.
 
 Why this is the pragmatic path:
 
@@ -378,8 +379,8 @@ Concrete contribution strategy:
 Track A: fork-first shipping path
 
 - Keep this repository as the authoritative HPy implementation branch.
-- Publish a separate distribution name later rather than overriding upstream
-  `ujson` packaging semantics immediately.
+- Publish under the separate `hpy-ujson` distribution name rather than
+  overriding upstream `ujson` packaging semantics.
 - Preserve `ujson_hpy` as the module name until the release contract for a
   drop-in replacement is explicit.
 
@@ -512,14 +513,13 @@ Release gating checklist for the fork track:
 - Keep the classic upstream test path green in the default non-HPy build.
 - Keep HPy CPython ABI and universal ABI test commands green.
 - Keep HPy debug leak checks green where available.
-- Decide the eventual distribution name before publishing artifacts.
+- Keep the `hpy-ujson` distribution name distinct from upstream.
 - Document supported import names, ABI targets, and non-goals clearly.
 
 First fork-release checklist:
 
-- Choose an initial package name distinct from upstream `ujson`.
-- Decide whether the first published artifact ships only `ujson_hpy` or also a
-  compatibility shim package.
+- Use `hpy-ujson` as the distribution name and `ujson_hpy` as its only import
+  surface; do not ship a compatibility shim in the first release.
 - Freeze the supported ABI matrix for the first release:
   - CPython HPy ABI
   - universal HPy ABI

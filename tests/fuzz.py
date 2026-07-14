@@ -1,6 +1,6 @@
 """
-A brute force fuzzer for detecting memory issues in ujson.dumps(). To use, first
-compile ujson in debug mode:
+A brute force fuzzer for detecting memory issues in JSON encoding. To use,
+first compile the target module in debug mode:
 
     CFLAGS='-DDEBUG' python setup.py -q build_ext --inplace -f
 
@@ -20,6 +20,7 @@ serialise as either a Python literal or in JSON.
 
 import argparse
 import gc
+import importlib
 import itertools
 import json
 import math
@@ -27,8 +28,6 @@ import random
 import re
 import sys
 from pprint import pprint
-
-import ujson
 
 
 class FuzzGenerator:
@@ -99,6 +98,12 @@ parser = argparse.ArgumentParser(
     epilog=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
 )
 parser.add_argument(
+    "--module",
+    choices=("ujson", "ujson_hpy"),
+    default="ujson",
+    help="Module whose dumps() implementation should be exercised.",
+)
+parser.add_argument(
     "--seed",
     default=range(100),
     action=RangeOption,
@@ -116,21 +121,21 @@ parser.add_argument(
     "--ensure_ascii",
     default=(0, 1),
     action=ListOption,
-    help="Sets the ensure_ascii option to ujson.dumps(). "
-    "May be 0 or 1 or 0,1 to testboth.",
+    help="Sets the ensure_ascii option to dumps(). "
+    "May be 0 or 1 or 0,1 to test both.",
 )
 parser.add_argument(
     "--encode_html_chars",
     default=(0, 1),
     action=ListOption,
-    help="Sets the encode_html_chars option to ujson.dumps(). "
+    help="Sets the encode_html_chars option to dumps(). "
     "May be 0 or 1 or 0,1 to test both.",
 )
 parser.add_argument(
     "--escape_forward_slashes",
     default=(0, 1),
     action=ListOption,
-    help="Sets the escape_forward_slashes option to ujson.dumps(). "
+    help="Sets the escape_forward_slashes option to dumps(). "
     "May be 0 or 1 or 0,1 to test both.",
 )
 parser.add_argument(
@@ -147,15 +152,17 @@ parser.add_argument(
 
 def cli(args=None):
     options = dict(parser.parse_args(args)._get_kwargs())
+    module_name = options.pop("module")
     if options.pop("dump_json"):
         print(json.dumps(random_object(options["seeds"][0]), indent=2))
     elif options.pop("dump_python"):
         pprint(random_object(options["seeds"][0]))
     else:
-        fuzz(**options)
+        fuzz(module_name=module_name, **options)
 
 
-def fuzz(seeds, **options):
+def fuzz(seeds, module_name="ujson", **options):
+    target = importlib.import_module(module_name)
     try:
         for seed in seeds:
             data = random_object(seed)
@@ -168,7 +175,7 @@ def fuzz(seeds, **options):
                 data_objects = [o for o in data_objects if not isinstance(o, int)]
                 gc.collect()
                 data_ref_counts_before = [sys.getrefcount(o) for o in data_objects]
-                ujson.dumps(data, **_options)
+                target.dumps(data, **_options)
                 gc.collect()
                 data_ref_counts_after = [sys.getrefcount(o) for o in data_objects]
                 if data_ref_counts_before != data_ref_counts_after:

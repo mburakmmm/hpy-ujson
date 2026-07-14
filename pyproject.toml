@@ -1,22 +1,25 @@
 [build-system]
 requires = [
-  "hpy>=0.9",
+  "hpy>=0.9,<0.10",
   "setuptools>=80",
   "setuptools-scm[simple]>=9.2",
 ]
 
 [project]
-name = "ujson"
-description = "Ultra fast JSON encoder and decoder for Python"
+name = "hpy-ujson"
+description = "HPy port of UltraJSON for CPython and Universal ABI hosts"
 readme = "README.md"
 license = "BSD-3-Clause AND TCL"
 license-files = [ "LICENSE.txt" ]
+maintainers = [
+  { name = "Melih Burak Memis" },
+]
 authors = [
   { name = "Jonas Tarnstrom" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"
 classifiers = [
-  "Development Status :: 5 - Production/Stable",
+  "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Programming Language :: C",
   "Programming Language :: Python :: 3 :: Only",
@@ -25,23 +28,23 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
-  "Programming Language :: Python :: 3.15",
   "Programming Language :: Python :: Implementation :: CPython",
-  "Programming Language :: Python :: Implementation :: GraalPy",
-  "Programming Language :: Python :: Implementation :: PyPy",
-  "Typing :: Typed",
 ]
 dynamic = [ "version" ]
-urls.Download = "https://github.com/ultrajson/ultrajson"
-urls.Homepage = "https://github.com/ultrajson/ultrajson"
-urls.Source = "https://github.com/ultrajson/ultrajson"
+urls.Changelog = "https://github.com/mburakmmm/hpy-ujson/releases"
+urls.Homepage = "https://github.com/mburakmmm/hpy-ujson"
+urls.Issues = "https://github.com/mburakmmm/hpy-ujson/issues"
+urls.Source = "https://github.com/mburakmmm/hpy-ujson"
 
 [tool.setuptools]
-packages = [ "ujson-stubs" ]
+packages = []
+
+[tool.black]
+target-version = [ "py310", "py311", "py312", "py313", "py314" ]
 
 [tool.isort]
 profile = "black"
-known_first_party = [ "ujson" ]
+known_first_party = [ "ujson", "ujson_hpy" ]
 
 [tool.pytest]
 markers = [ "skip_leak_test: Don't rerun this test in search for memory leaks" ]

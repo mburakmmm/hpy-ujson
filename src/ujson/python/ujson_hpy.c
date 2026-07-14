@@ -822,7 +822,8 @@ hpy_loads_dispatch(HPyContext *ctx, HPy arg)
   }
 
   HPyErr_SetString(ctx, ctx->h_TypeError,
-                   "Expected string, bytes, or bytearray");
+                   "Expected str, bytes, bytearray, or a C-contiguous "
+                   "bytes-like object");
   return HPy_NULL;
 }
 
@@ -2838,7 +2839,7 @@ static HPyDef *module_defines[] = {
 };
 
 static HPyModuleDef moduledef = {
-  .doc = "Experimental HPy bootstrap for UltraJSON",
+  .doc = "HPy port of the UltraJSON encoder and decoder",
   .size = 0,
   .defines = module_defines
 };

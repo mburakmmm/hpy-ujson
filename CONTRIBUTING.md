@@ -31,12 +31,20 @@ Create a local virtual environment and install the development dependencies:
 ```sh
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip setuptools setuptools-scm pytest hpy tox
+python -m pip install --upgrade pip setuptools setuptools-scm pytest "hpy>=0.9,<0.10" tox
 ```
 
-The default CPython extension can be built and tested with:
+The default package build installs the HPy CPython ABI module:
 
 ```sh
+python -m pip install .
+python -c 'import ujson_hpy; print(ujson_hpy._hpy_abi())'
+```
+
+The classic upstream extension remains available for regression testing:
+
+```sh
+UJSON_BUILD_HPY=0 UJSON_BUILD_CPYTHON_EXT=1 python setup.py build_ext --inplace
 python -m pytest -q
 ```
 
@@ -76,6 +84,20 @@ checks:
 ```sh
 ./scripts/hpy-smoke.sh cpython
 ./scripts/hpy-smoke.sh universal
+```
+
+Native encoder and decoder smoke fuzzing can be run against a built artifact:
+
+```sh
+PYTHONPATH=build/hpy-universal/lib python tests/fuzz.py --module ujson_hpy --seed=0:1000
+PYTHONPATH=build/hpy-universal/lib python tests/fuzz_decode.py --module ujson_hpy --seed=0:5000
+```
+
+Before changing packaging, verify the wheel and source distribution contract:
+
+```sh
+python -m pip install build twine
+./scripts/check-package.sh
 ```
 
 ## Git Workflow
@@ -147,6 +169,7 @@ Useful references:
 - [docs/ujson-hpy-api.md](./docs/ujson-hpy-api.md)
 - [docs/hpy-performance-plan.md](./docs/hpy-performance-plan.md)
 - [docs/hpy-getitem-i-fastpath.md](./docs/hpy-getitem-i-fastpath.md)
+- [Security policy](./.github/SECURITY.md)
 
 ## Reporting Issues
 

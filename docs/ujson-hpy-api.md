@@ -339,13 +339,13 @@ Then add:
 
 ## Current Status
 
-This port is intentionally named `ujson_hpy` and remains separate from the
-classic `ujson` module. It is suitable for integration work, host validation,
-and benchmark-driven optimization. In this workspace it is validated through
+This port is distributed as `hpy-ujson`, imported as `ujson_hpy`, and remains
+separate from the classic `ujson` module. It is suitable for integration work,
+host validation, and benchmark-driven optimization. In this workspace it is validated through
 the classic suite (`476 passed, 40 skipped, 1 xfailed`), the HPy CPython suite
 (`174 passed, 4 skipped`), the HPy Universal suite (`178 passed`), HPy debug
 mode (`178 passed`), and isolated smoke imports. It is still not presented as a
-published drop-in replacement package.
+published as a drop-in replacement for upstream `ujson`.
 
 For current measured performance and the host-side `HPy_GetItem_i` fast-path
 experiment, see:

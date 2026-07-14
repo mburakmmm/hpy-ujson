@@ -43,7 +43,7 @@ def env_flag(name, default="0"):
 
 
 version = get_version(local_scheme=local_scheme)
-build_hpy = env_flag("UJSON_BUILD_HPY")
+build_hpy = env_flag("UJSON_BUILD_HPY", "1")
 build_cpython_ext = env_flag("UJSON_BUILD_CPYTHON_EXT", "0" if build_hpy else "1")
 
 if build_hpy:
@@ -145,6 +145,5 @@ if build_hpy:
 setup(
     hpy_ext_modules=hpy_ext_modules,
     ext_modules=cpython_ext_modules,
-    setup_requires=["hpy"] if build_hpy else [],
     use_scm_version={"local_scheme": local_scheme},
 )

@@ -121,7 +121,10 @@ def test_ujson_hpy_load_rejects_non_callable_read_attribute():
 def test_ujson_hpy_loads_rejects_unsupported_input():
     ujson_hpy = pytest.importorskip("ujson_hpy")
 
-    with pytest.raises(TypeError, match="Expected string, bytes, or bytearray"):
+    with pytest.raises(
+        TypeError,
+        match="Expected str, bytes, bytearray, or a C-contiguous bytes-like object",
+    ):
         ujson_hpy.loads(object())
 
 

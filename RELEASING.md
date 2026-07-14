@@ -1,7 +1,8 @@
 # Release Checklist
 
-This repository is an HPy-focused fork, so a release should prove both the
-classic `ujson` path and the `ujson_hpy` path are in a known-good state.
+This repository publishes the `hpy-ujson` distribution and imports it as
+`ujson_hpy`. A release should prove both the primary HPy path and the retained
+classic `ujson` regression path are in a known-good state.
 
 ## Before tagging
 
@@ -11,6 +12,7 @@ classic `ujson` path and the `ujson_hpy` path are in a known-good state.
 - [ ] Run the classic suite:
 
 ```bash
+UJSON_BUILD_HPY=0 UJSON_BUILD_CPYTHON_EXT=1 .venv/bin/python setup.py build_ext --inplace
 .venv/bin/python -m pytest -q
 ```
 
@@ -29,6 +31,20 @@ HPY=debug ./scripts/hpy-test.sh universal
 ./scripts/hpy-smoke.sh universal
 ```
 
+- [ ] Build and inspect the wheel and source distribution:
+
+```bash
+.venv/bin/python -m pip install build twine
+./scripts/check-package.sh
+```
+
+- [ ] Run deterministic native-path smoke fuzzing:
+
+```bash
+PYTHONPATH=build/hpy-universal/lib .venv/bin/python tests/fuzz.py --module ujson_hpy --seed=0:1000
+PYTHONPATH=build/hpy-universal/lib .venv/bin/python tests/fuzz_decode.py --module ujson_hpy --seed=0:5000
+```
+
 - [ ] If the release includes performance claims, archive fresh matrix output:
 
 ```bash
@@ -36,12 +52,11 @@ HPY=debug ./scripts/hpy-test.sh universal
 ./scripts/hpy-benchmark-matrix.sh universal --repeat 9 --min-time 0.10
 ```
 
-## Packaging decisions
+## Packaging contract
 
-- [ ] Confirm the release notes state whether the artifact is:
-      - source-only repository release
-      - private/internal package
-      - public package with a name distinct from upstream `ujson`
+- [ ] Confirm the distribution metadata name is `hpy-ujson`.
+- [ ] Confirm the installed import name is `ujson_hpy`.
+- [ ] Confirm the package does not install or register classic `ujson`.
 - [ ] Keep the `ujson_hpy` module name explicit unless the compatibility
       contract has been intentionally widened.
 - [ ] If host-runtime patch files are relevant to the release, mention the
@@ -49,10 +64,13 @@ HPY=debug ./scripts/hpy-test.sh universal
 
 ## Tag and publish
 
+Automated PyPI publishing is intentionally disabled. Do not add a publishing
+workflow until trusted publishing is configured specifically for `hpy-ujson`
+and the wheel policy for Universal ABI hosts is documented.
+
 - [ ] Create the release commit and tag.
 - [ ] Push the branch and tag to `origin`.
 - [ ] Publish the GitHub release in
       [mburakmmm/hpy-ujson](https://github.com/mburakmmm/hpy-ujson/releases).
-- [ ] If a package was published, verify installation/import with the chosen
-      distribution name and with a direct local artifact import of
-      `ujson_hpy`.
+- [ ] If a package was published, verify `pip install hpy-ujson` in a clean
+      environment and perform a direct Universal ABI artifact import.

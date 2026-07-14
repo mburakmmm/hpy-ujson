@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import importlib.util
 import io
 import json
 import sys
+from pathlib import Path
 
 
 def main() -> int:
@@ -17,13 +19,24 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    spec = importlib.util.find_spec("ujson_hpy")
+    if spec is None or spec.origin is None:
+        raise AssertionError("could not locate the ujson_hpy artifact")
+    if args.expected_abi == "universal":
+        loader_path = Path(spec.origin)
+        loader_source = loader_path.read_text(encoding="utf-8")
+        if "pkg_resources" in loader_source:
+            raise AssertionError("Universal loader must not depend on pkg_resources")
+        if "dirname(__file__)" not in loader_source:
+            raise AssertionError("Universal loader must resolve a sibling artifact")
+        if not next(loader_path.parent.glob("ujson_hpy.hpy*.so"), None):
+            raise AssertionError("Universal loader has no sibling HPy artifact")
+
     import ujson_hpy
 
     actual_abi = ujson_hpy._hpy_abi()
     if actual_abi != args.expected_abi:
-        raise AssertionError(
-            f"Expected ABI {args.expected_abi!r}, got {actual_abi!r}"
-        )
+        raise AssertionError(f"Expected ABI {args.expected_abi!r}, got {actual_abi!r}")
 
     payload = {
         "answer": 42,
@@ -34,7 +47,13 @@ def main() -> int:
 
     encoded = ujson_hpy.dumps(payload, sort_keys=True)
     decoded = ujson_hpy.loads(encoded)
-    if decoded != {"answer": 42, "flags": [True, False, None], "nested": {"alpha": 1, "beta": 2}, "unicode": "merhaba dunya"}:
+    expected = {
+        "answer": 42,
+        "flags": [True, False, None],
+        "nested": {"alpha": 1, "beta": 2},
+        "unicode": "merhaba dunya",
+    }
+    if decoded != expected:
         raise AssertionError(f"Unexpected roundtrip result: {decoded!r}")
 
     if json.loads(encoded) != decoded:
